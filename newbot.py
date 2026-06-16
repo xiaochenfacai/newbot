@@ -831,6 +831,130 @@ def get_group_lang(group_id):
     return normalize_lang_code(stored)
 
 
+WEB_TEXTS = {
+    "zh": {
+        "page_title": "网页账单",
+        "dashboard_title": "对账看板",
+        "group_id": "群组 ID: {id}",
+        "loading": "加载中...",
+        "summary_all": "查看全部历史",
+        "summary_day": "当前日期 {date}（北京时间）",
+        "income_unit": "入款",
+        "expense_unit": "下发",
+        "count_unit": "笔",
+        "btn_prev": "◀ 跳前",
+        "btn_next": "跳后 ▶",
+        "btn_all": "全部历史",
+        "date_label": "账单日期：",
+        "income_title": "入款（{n}笔）",
+        "expense_title": "下发（{n}笔）",
+        "category_title": "备注分类",
+        "th_date": "日期",
+        "th_time": "时间",
+        "th_remark": "备注",
+        "th_rmb": "RMB",
+        "th_u": "U",
+        "th_usdt": "USDT",
+        "th_operator": "操作人",
+        "th_count": "笔数",
+        "card_rate": "汇率",
+        "card_total_rmb": "总入款 RMB",
+        "card_total_usdt": "总入款 USDT",
+        "card_expense_usdt": "已下发 USDT",
+        "card_remaining_usdt": "未下发 USDT",
+        "no_data": "暂无",
+        "no_remark": "无备注",
+        "no_income": "暂无入款",
+        "no_expense": "暂无下发",
+    },
+    "eng": {
+        "page_title": "Web Bill",
+        "dashboard_title": "Reconciliation",
+        "group_id": "Group ID: {id}",
+        "loading": "Loading...",
+        "summary_all": "All history",
+        "summary_day": "Date {date} (Beijing time)",
+        "income_unit": "Deposits",
+        "expense_unit": "Payouts",
+        "count_unit": "items",
+        "btn_prev": "◀ Prev",
+        "btn_next": "Next ▶",
+        "btn_all": "All history",
+        "date_label": "Bill date:",
+        "income_title": "Deposits ({n})",
+        "expense_title": "Payouts ({n})",
+        "category_title": "Remark categories",
+        "th_date": "Date",
+        "th_time": "Time",
+        "th_remark": "Remark",
+        "th_rmb": "RMB",
+        "th_u": "U",
+        "th_usdt": "USDT",
+        "th_operator": "Operator",
+        "th_count": "Count",
+        "card_rate": "Rate",
+        "card_total_rmb": "Total RMB",
+        "card_total_usdt": "Total USDT",
+        "card_expense_usdt": "Issued USDT",
+        "card_remaining_usdt": "Remaining USDT",
+        "no_data": "None",
+        "no_remark": "No remark",
+        "no_income": "No deposits",
+        "no_expense": "No payouts",
+    },
+    "my": {
+        "page_title": "ဝဘ်ဘီလ်",
+        "dashboard_title": "စာရင်းညှိ",
+        "group_id": "အုပ်စု ID: {id}",
+        "loading": "တင်နေသည်...",
+        "summary_all": "မှတ်တမ်းအားလုံး",
+        "summary_day": "ရက်စွဲ {date}（Beijing）",
+        "income_unit": "ဝင်ငွေ",
+        "expense_unit": "ထုတ်ပေးမှု",
+        "count_unit": "ခု",
+        "btn_prev": "◀ ရှေ့",
+        "btn_next": "နောက် ▶",
+        "btn_all": "အားလုံး",
+        "date_label": "ဘီလ်ရက်：",
+        "income_title": "ဝင်ငွေ ({n} ခု)",
+        "expense_title": "ထုတ်ပေးမှု ({n} ခု)",
+        "category_title": "မှတ်ချက်အမျိုးအစား",
+        "th_date": "ရက်",
+        "th_time": "အချိန်",
+        "th_remark": "မှတ်ချက်",
+        "th_rmb": "RMB",
+        "th_u": "U",
+        "th_usdt": "USDT",
+        "th_operator": "Operator",
+        "th_count": "အရေအတွက်",
+        "card_rate": "နှုန်းထား",
+        "card_total_rmb": "စုဝင်ငွေ RMB",
+        "card_total_usdt": "စုဝင်ငွေ USDT",
+        "card_expense_usdt": "ထုတ်ပေးပြီး USDT",
+        "card_remaining_usdt": "မထုတ်ရသေး USDT",
+        "no_data": "မရှိ",
+        "no_remark": "မှတ်ချက်မရှိ",
+        "no_income": "ဝင်ငွေမရှိ",
+        "no_expense": "ထုတ်ပေးမှုမရှိ",
+    },
+}
+
+
+def web_tr(lang, key, **kwargs):
+    lang = normalize_lang_code(lang)
+    template = WEB_TEXTS.get(lang, WEB_TEXTS["zh"]).get(key) or WEB_TEXTS["zh"].get(key, key)
+    return template.format(**kwargs) if kwargs else template
+
+
+def resolve_web_lang(group_id, lang_param=None):
+    if lang_param:
+        code = normalize_lang_code(lang_param)
+        if code in SUPPORTED_LANGS:
+            return code
+    if group_id:
+        return get_group_lang(group_id)
+    return "zh"
+
 def tr(group_id, key, **kwargs):
     lang = get_group_lang(group_id)
     template = TEXTS.get(lang, TEXTS["zh"]).get(key) or TEXTS["zh"].get(key, key)
@@ -1987,13 +2111,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>分布式全功能网页账单</title>
+<title>Bill</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,sans-serif}
 body{background:#f4f6f9;color:#475569;padding:12px;line-height:1.35;font-size:12px}
 .container{max-width:800px;margin:0 auto;background:#fff;border-radius:12px;padding:14px;box-shadow:0 4px 12px rgba(0,0,0,.05);font-size:12px}
 .header{text-align:center;margin-bottom:16px;border-bottom:2px solid #edf2f7;padding-bottom:12px}
 .header h2{font-size:16px;color:#334155}
+.lang-switch{display:flex;gap:6px;justify-content:center;margin-top:10px;flex-wrap:wrap}
+.lang-btn{padding:4px 12px;border-radius:999px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;font-size:11px;color:#334155}
+.lang-btn.active{background:#3b82f6;color:#fff;border-color:#3b82f6}
 .date-picker{margin:10px 0;background:#f8fafc;padding:8px;border-radius:6px;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:8px;border:1px dashed #cbd5e1;font-size:11px}
 .date-tags{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:6px}
 .date-tag{font-size:11px;padding:3px 7px;border-radius:999px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;text-decoration:none;color:#334155}
@@ -2021,40 +2148,55 @@ th{background:#f1f5f9;color:#64748b;font-size:11px}
 <body>
 <div class="container">
 <div class="header">
-<h2>📊 分布式对账看板</h2>
-<p id="group-text" style="font-size:12px;color:#64748b;margin-top:4px">加载中...</p>
+<h2 id="dashboard-title">...</h2>
+<p id="group-text" style="font-size:12px;color:#64748b;margin-top:4px">...</p>
+<div class="lang-switch">
+<button type="button" class="lang-btn" data-lang="zh">Chinese</button>
+<button type="button" class="lang-btn" data-lang="eng">Eng</button>
+<button type="button" class="lang-btn" data-lang="my">Myanmar</button>
+</div>
 <p id="summary-text" class="hint"></p>
 <div class="date-picker">
-<button id="btn-prev" type="button" class="nav-btn">◀ 跳前</button>
-<label for="date-select">📅 账单日期：</label>
+<button id="btn-prev" type="button" class="nav-btn">...</button>
+<label for="date-select" id="date-label">...</label>
 <input type="date" id="date-select">
-<button id="btn-next" type="button" class="nav-btn">跳后 ▶</button>
-<button id="btn-all" type="button" class="nav-btn">全部历史</button>
+<button id="btn-next" type="button" class="nav-btn">...</button>
+<button id="btn-all" type="button" class="nav-btn">...</button>
 </div>
 <div id="date-tags" class="date-tags"></div>
 </div>
-<h3 id="income-title">📥 入款（0笔）</h3>
-<table><thead><tr><th>日期</th><th>时间</th><th>备注</th><th>RMB</th><th>U</th><th>操作人</th></tr></thead><tbody id="income-list"></tbody></table>
-<h3 class="exp-title" id="expense-title">📤 下发（0笔）</h3>
-<table><thead><tr><th>日期</th><th>时间</th><th>备注</th><th>USDT</th><th>操作人</th></tr></thead><tbody id="expense-list"></tbody></table>
-<h3 class="cate-title">🗂️ 备注分类</h3>
-<table><thead><tr><th>备注</th><th>RMB</th><th>USDT</th><th>笔数</th></tr></thead><tbody id="cate-list"></tbody></table>
+<h3 id="income-title">...</h3>
+<table><thead><tr>
+<th id="th-inc-date">...</th><th id="th-inc-time">...</th><th id="th-inc-remark">...</th>
+<th id="th-inc-rmb">...</th><th id="th-inc-u">...</th><th id="th-inc-op">...</th>
+</tr></thead><tbody id="income-list"></tbody></table>
+<h3 class="exp-title" id="expense-title">...</h3>
+<table><thead><tr>
+<th id="th-exp-date">...</th><th id="th-exp-time">...</th><th id="th-exp-remark">...</th>
+<th id="th-exp-usdt">...</th><th id="th-exp-op">...</th>
+</tr></thead><tbody id="expense-list"></tbody></table>
+<h3 class="cate-title" id="category-title">...</h3>
+<table><thead><tr>
+<th id="th-cate-remark">...</th><th id="th-cate-rmb">...</th><th id="th-cate-u">...</th><th id="th-cate-count">...</th>
+</tr></thead><tbody id="cate-list"></tbody></table>
 <div class="summary-grid">
-<div class="card"><div class="title">汇率</div><div class="value" id="rate">0</div></div>
-<div class="card"><div class="title">总入款 RMB</div><div class="value" id="total_rmb">0</div></div>
-<div class="card"><div class="title">总入款 USDT</div><div class="value" id="total_usdt">0U</div></div>
-<div class="card"><div class="title">已下发 USDT</div><div class="value" id="expense_usdt">0U</div></div>
-<div class="card" style="grid-column:span 2"><div class="title">未下发 USDT</div><div class="value" id="remaining_usdt">0U</div></div>
+<div class="card"><div class="title" id="card-rate">...</div><div class="value" id="rate">0</div></div>
+<div class="card"><div class="title" id="card-total-rmb">...</div><div class="value" id="total_rmb">0</div></div>
+<div class="card"><div class="title" id="card-total-usdt">...</div><div class="value" id="total_usdt">0U</div></div>
+<div class="card"><div class="title" id="card-expense-usdt">...</div><div class="value" id="expense_usdt">0U</div></div>
+<div class="card" style="grid-column:span 2"><div class="title" id="card-remaining-usdt">...</div><div class="value" id="remaining_usdt">0U</div></div>
 </div>
 </div>
 <script>
 const params=new URLSearchParams(location.search);
 const groupId=params.get('group_id')||'0';
 let currentDate=params.get('date')||'';
-document.getElementById('group-text').textContent='群组 ID: '+groupId;
+let labels={};
+let currentLang='zh';
 const ds=document.getElementById('date-select');
 const btnPrev=document.getElementById('btn-prev');
 const btnNext=document.getElementById('btn-next');
+function fmt(s,vars){return String(s).replace(/\\{(\\w+)\\}/g,(_,k)=>vars[k]??'');}
 function localToday(){
 const n=new Date();
 return n.getFullYear()+'-'+String(n.getMonth()+1).padStart(2,'0')+'-'+String(n.getDate()).padStart(2,'0');
@@ -2065,9 +2207,49 @@ const dt=new Date(p[0],p[1]-1,p[2]);
 dt.setDate(dt.getDate()+delta);
 return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
 }
-function goDate(d){
-location.href='?group_id='+groupId+'&date='+encodeURIComponent(d);
+function pageUrl(extraDate){
+let u='?group_id='+encodeURIComponent(groupId);
+const d=extraDate!==undefined?extraDate:currentDate;
+if(d){u+='&date='+encodeURIComponent(d);}
+return u;
 }
+function goDate(d){location.href=pageUrl(d);}
+function applyStaticLabels(){
+document.title=labels.page_title||'Bill';
+document.getElementById('dashboard-title').textContent=labels.dashboard_title||'';
+document.getElementById('group-text').textContent=fmt(labels.group_id||'',{id:groupId});
+document.getElementById('date-label').textContent=labels.date_label||'';
+btnPrev.textContent=labels.btn_prev||'';
+btnNext.textContent=labels.btn_next||'';
+document.getElementById('btn-all').textContent=labels.btn_all||'';
+document.getElementById('category-title').textContent=labels.category_title||'';
+['date','time','remark','rmb','u','op'].forEach(k=>{
+const el=document.getElementById('th-inc-'+k);
+if(el)el.textContent=labels['th_'+k]||'';
+});
+['date','time','remark','usdt','op'].forEach(k=>{
+const el=document.getElementById('th-exp-'+k);
+if(el)el.textContent=labels['th_'+k]||'';
+});
+document.getElementById('th-cate-remark').textContent=labels.th_remark||'';
+document.getElementById('th-cate-rmb').textContent=labels.th_rmb||'';
+document.getElementById('th-cate-u').textContent=labels.th_u||'';
+document.getElementById('th-cate-count').textContent=labels.th_count||'';
+document.getElementById('card-rate').textContent=labels.card_rate||'';
+document.getElementById('card-total-rmb').textContent=labels.card_total_rmb||'';
+document.getElementById('card-total-usdt').textContent=labels.card_total_usdt||'';
+document.getElementById('card-expense-usdt').textContent=labels.card_expense_usdt||'';
+document.getElementById('card-remaining-usdt').textContent=labels.card_remaining_usdt||'';
+document.querySelectorAll('.lang-btn').forEach(btn=>{
+btn.classList.toggle('active', btn.dataset.lang===currentLang);
+});
+}
+async function setLanguage(lang){
+if(!groupId||groupId==='0')return;
+await fetch('/api/set-language?group_id='+encodeURIComponent(groupId)+'&lang='+encodeURIComponent(lang),{method:'POST'});
+location.href=pageUrl(currentDate||'');
+}
+document.querySelectorAll('.lang-btn').forEach(btn=>{btn.onclick=()=>setLanguage(btn.dataset.lang);});
 ds.onchange=()=>goDate(ds.value);
 document.getElementById('btn-all').onclick=()=>goDate('all');
 btnPrev.onclick=()=>{
@@ -2084,18 +2266,22 @@ goDate(next);
 async function load(){
 const d=currentDate||localToday();
 if(d!=='all'){ds.value=d;}
-const r=await fetch('/api/bill?group_id='+groupId+'&date='+encodeURIComponent(d));
+const r=await fetch('/api/bill?group_id='+encodeURIComponent(groupId)+'&date='+encodeURIComponent(d));
 const data=await r.json();
 if(data.server_today && !params.get('date')){goDate(data.server_today);return;}
 window.__serverToday=data.server_today||localToday();
+labels=data.labels||{};
+currentLang=data.language||'zh';
+applyStaticLabels();
 const viewDay=(d==='all')?window.__serverToday:d;
 btnPrev.disabled=false;
 btnNext.disabled=(viewDay>=window.__serverToday);
+const summaryPart=(d==='all'?labels.summary_all:fmt(labels.summary_day,{date:d}));
 document.getElementById('summary-text').textContent=
-(d==='all'?'查看全部历史':('当前日期 '+d+'（北京时间）'))+
-' · 入款 '+data.income_count+' 笔 · 下发 '+data.expense_count+' 笔';
-document.getElementById('income-title').textContent='📥 入款（'+data.income_count+'笔）';
-document.getElementById('expense-title').textContent='📤 下发（'+data.expense_count+'笔）';
+summaryPart+' · '+labels.income_unit+' '+data.income_count+' '+labels.count_unit
++' · '+labels.expense_unit+' '+data.expense_count+' '+labels.count_unit;
+document.getElementById('income-title').textContent=fmt(labels.income_title,{n:data.income_count});
+document.getElementById('expense-title').textContent=fmt(labels.expense_title,{n:data.expense_count});
 ['rate','total_rmb'].forEach(k=>document.getElementById(k).textContent=data[k]);
 document.getElementById('total_usdt').textContent=data.total_usdt+' U';
 document.getElementById('expense_usdt').textContent=data.expense_usdt+' U';
@@ -2103,18 +2289,19 @@ document.getElementById('remaining_usdt').textContent=data.remaining_usdt+' U';
 const tags=document.getElementById('date-tags');
 tags.innerHTML=(data.available_dates||[]).map(x=>{
 const active=(d===x.date)?' active':'';
-return '<a class="date-tag'+active+'" href="?group_id='+groupId+'&date='+x.date+'">'
+return '<a class="date-tag'+active+'" href="'+pageUrl(x.date)+'">'
 +x.date+' ('+x.income+'/'+x.expense+')</a>';
 }).join('');
+const noData=labels.no_data||'';
 document.getElementById('cate-list').innerHTML=(data.category_summary||[]).length
 ?data.category_summary.map(c=>'<tr><td><span class="badge bg-inc c-remark">'+c.remark+'</span></td><td><span class="c-rmb">'+c.total_rmb+'</span></td><td class="c-u">'+c.total_usdt+' U</td><td>'+c.count+'</td></tr>').join('')
-:'<tr><td colspan="4" style="text-align:center;color:#94a3b8">暂无</td></tr>';
+:'<tr><td colspan="4" style="text-align:center;color:#94a3b8">'+noData+'</td></tr>';
 document.getElementById('income-list').innerHTML=(data.income_bills||[]).length
 ?data.income_bills.map(b=>'<tr><td>'+b.date+'</td><td>'+b.time+'</td><td><span class="c-remark">'+b.remark+'</span></td><td><span class="c-rmb">+'+b.amount+'</span></td><td class="c-u">'+b.usdt+' U</td><td><span class="c-op">'+b.username+'</span></td></tr>').join('')
-:'<tr><td colspan="6" style="text-align:center;color:#94a3b8">暂无入款</td></tr>';
+:'<tr><td colspan="6" style="text-align:center;color:#94a3b8">'+(labels.no_income||noData)+'</td></tr>';
 document.getElementById('expense-list').innerHTML=(data.expense_bills||[]).length
 ?data.expense_bills.map(e=>'<tr><td>'+e.date+'</td><td>'+e.time+'</td><td><span class="c-remark">'+e.remark+'</span></td><td class="c-u">-'+e.usdt+' U</td><td><span class="c-op">'+e.username+'</span></td></tr>').join('')
-:'<tr><td colspan="5" style="text-align:center;color:#94a3b8">暂无下发</td></tr>';
+:'<tr><td colspan="5" style="text-align:center;color:#94a3b8">'+(labels.no_expense||noData)+'</td></tr>';
 }
 load();
 </script>
@@ -2134,6 +2321,10 @@ def api_bill():
     except ValueError:
         group_id = 0
 
+    lang = resolve_web_lang(group_id, request.args.get("lang"))
+    empty_remark = web_tr(lang, "no_remark")
+    unknown_user = {"zh": "未知", "eng": "Unknown", "my": "မသိ"}[lang]
+
     tz = get_setting(group_id, "timezone") or "Asia/Shanghai"
     now, _, _ = get_current_time(tz)
     server_today = now.strftime("%Y-%m-%d")
@@ -2147,8 +2338,8 @@ def api_bill():
 
     income_bills = [
         {
-            "remark": r[0] or "无备注",
-            "username": r[1] or "未知",
+            "remark": r[0] or empty_remark,
+            "username": r[1] or unknown_user,
             "amount": f"{r[2]:.0f}",
             "usdt": f"{r[3]:.2f}",
             "time": r[5][11:19] if r[5] else "",
@@ -2158,8 +2349,8 @@ def api_bill():
     ]
     expense_bills = [
         {
-            "remark": r[0] or "无备注",
-            "username": r[1] or "未知",
+            "remark": r[0] or empty_remark,
+            "username": r[1] or unknown_user,
             "usdt": f"{r[2]:.2f}",
             "time": r[4][11:19] if r[4] else "",
             "date": r[5] if len(r) > 5 else target_date,
@@ -2169,7 +2360,7 @@ def api_bill():
 
     summary = {}
     for row in income:
-        rem = (row[0] or "空备注").strip() or "空备注"
+        rem = (row[0] or "").strip() or empty_remark
         summary.setdefault(rem, {"total_rmb": 0.0, "total_usdt": 0.0, "count": 0})
         summary[rem]["total_rmb"] += row[2] or 0
         summary[rem]["total_usdt"] += row[3] or 0
@@ -2187,6 +2378,7 @@ def api_bill():
 
     return jsonify({
         "exchange_rate": f"{rate:.2f}",
+        "rate": f"{rate:.2f}",
         "total_rmb": f"{total_rmb:.0f}",
         "total_usdt": f"{total_usdt:.2f}",
         "expense_usdt": f"{expense_usdt:.2f}",
@@ -2199,7 +2391,24 @@ def api_bill():
         "server_today": server_today,
         "query_date": target_date,
         "available_dates": get_bill_dates(group_id),
+        "language": lang,
+        "labels": WEB_TEXTS.get(lang, WEB_TEXTS["zh"]),
     })
+
+
+@flask_app.route("/api/set-language", methods=["POST"])
+def api_set_language():
+    try:
+        group_id = int(request.args.get("group_id", "0").strip())
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid group_id"}), 400
+    if not group_id:
+        return jsonify({"ok": False, "error": "group_id required"}), 400
+    lang = normalize_lang_code(request.args.get("lang", "zh"))
+    if lang not in SUPPORTED_LANGS:
+        return jsonify({"ok": False, "error": "invalid lang"}), 400
+    update_setting(group_id, "language", lang)
+    return jsonify({"ok": True, "language": lang})
 
 
 @flask_app.route("/health")
