@@ -28,7 +28,7 @@ TOKEN = (
     or os.environ.get("BOT_TOKEN")
     or ""
 ).strip()
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://caicai-799gg.onrender.com").rstrip("/")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://newbot-oenu.onrender.com").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
 # ========== 品牌与价格（复制新机器人时主要改这里）==========
