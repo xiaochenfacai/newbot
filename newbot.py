@@ -2218,17 +2218,18 @@ def webhook():
 # Entry point
 # ---------------------------------------------------------------------------
 def setup_bot_commands():
-    """注册 /start 到 Telegram 输入框左侧 Menu（☰）里。"""
+    """私聊左侧 Menu（☰）显示 /start、/help；群内不显示 slash 命令提示。"""
     commands = [
         telebot.types.BotCommand("start", "打开主菜单"),
         telebot.types.BotCommand("help", "使用帮助"),
     ]
     try:
-        bot.set_my_commands(commands, scope=telebot.types.BotCommandScopeDefault())
         bot.set_my_commands(commands, scope=telebot.types.BotCommandScopeAllPrivateChats())
+        bot.set_my_commands([], scope=telebot.types.BotCommandScopeAllGroupChats())
+        bot.set_my_commands([], scope=telebot.types.BotCommandScopeDefault())
         bot.set_chat_menu_button(menu_button=telebot.types.MenuButtonCommands())
         me = bot.get_me()
-        log.info("Bot menu OK (@%s): /start, /help", me.username)
+        log.info("Bot menu OK (@%s): private /start, /help; groups cleared", me.username)
     except Exception as exc:
         log.exception("注册 Bot 左侧 Menu 失败: %s", exc)
 
