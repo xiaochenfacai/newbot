@@ -1,6 +1,7 @@
 """
 小财家记账 Telegram Bot + Flask Web 看板
 部署环境变量: TELEGRAM_TOKEN, WEBHOOK_URL, PORT (可选)
+持久化: DATABASE_PATH（Render 请挂载 Disk 到 /data 并设 DATABASE_PATH=/data/bot_data.db）
 """
 
 import json
@@ -8,6 +9,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import sqlite3
 import io
 from datetime import datetime, timedelta
@@ -30,6 +32,19 @@ TOKEN = (
 ).strip()
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://newbot-oenu.onrender.com").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
+DEFAULT_TZ = "Asia/Shanghai"
+
+
+def _default_database_path():
+    env_path = os.environ.get("DATABASE_PATH", "").strip()
+    if env_path:
+        return env_path
+    if os.path.isdir("/data"):
+        return "/data/bot_data.db"
+    return "bot_data.db"
+
+
+DATABASE_PATH = _default_database_path()
 
 # ========== 品牌与价格（复制新机器人时主要改这里）==========
 BOT_NAME = "小财家"
@@ -38,7 +53,11 @@ PRICE_1_MONTH = 80
 PRICE_2_MONTH = 140
 PRICE_3_MONTH = 220
 
-FOUNDER_USERS = [8551762310]
+FOUNDER_USERS = [
+    int(x.strip())
+    for x in os.environ.get("FOUNDER_USER_IDS", "8807178282").split(",")
+    if x.strip().isdigit()
+] or [8807178282]
 # 卖家联系方式：陌生人想买第二款机器人时展示。可填用户名，或留空自动读 SELLER_USER_ID 的 @用户名
 SELLER_USER_ID = int(os.environ.get("SELLER_USER_ID", str(FOUNDER_USERS[0])))
 SELLER_USERNAME = os.environ.get("SELLER_USERNAME", "Baima86").strip().lstrip("@")
@@ -160,9 +179,109 @@ def fetch_blockchain_usdt_info(address):
 # Database
 # ---------------------------------------------------------------------------
 def get_db():
-    conn = sqlite3.connect("bot_data.db", timeout=60.0)
+    db_dir = os.path.dirname(os.path.abspath(DATABASE_PATH))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=60.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
+
+
+def now_shanghai():
+    return datetime.now(pytz.timezone(DEFAULT_TZ)).replace(tzinfo=None)
+
+
+def now_shanghai_str():
+    return now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_expire_time(value):
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(str(value).strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def is_expire_active(expire_time_str):
+    expire = parse_expire_time(expire_time_str)
+    if not expire:
+        return False
+    return now_shanghai() < expire
+
+
+def format_expire_remaining(expire_time_str):
+    expire = parse_expire_time(expire_time_str)
+    if not expire:
+        return ""
+    delta = expire - now_shanghai()
+    if delta.total_seconds() <= 0:
+        return "已到期"
+    days = delta.days
+    hours = (delta.seconds // 3600) % 24
+    if days > 0:
+        return f"还剩 {days} 天 {hours} 小时"
+    return f"还剩 {hours} 小时"
+
+
+def backup_database():
+    """把数据库复制到 backups 目录，部署/故障时可恢复。"""
+    if not os.path.exists(DATABASE_PATH):
+        return None
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(DATABASE_PATH)), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = now_shanghai().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(backup_dir, f"bot_data_{stamp}.db")
+    shutil.copy2(DATABASE_PATH, dest)
+    backups = sorted(
+        [f for f in os.listdir(backup_dir) if f.startswith("bot_data_") and f.endswith(".db")],
+        reverse=True,
+    )
+    for old in backups[14:]:
+        try:
+            os.remove(os.path.join(backup_dir, old))
+        except OSError:
+            pass
+    return dest
+
+
+def get_db_stats():
+    stats = {
+        "db_path": os.path.abspath(DATABASE_PATH),
+        "db_size": 0,
+        "vip_users": 0,
+        "bills": 0,
+        "settings": 0,
+        "vip1": None,
+        "backups": 0,
+    }
+    if os.path.exists(DATABASE_PATH):
+        stats["db_size"] = os.path.getsize(DATABASE_PATH)
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM vip_users")
+        stats["vip_users"] = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM bills")
+        stats["bills"] = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM settings")
+        stats["settings"] = c.fetchone()[0]
+        c.execute("SELECT user_id, expire_time FROM vip_users WHERE level = 1 LIMIT 1")
+        row = c.fetchone()
+        if row:
+            stats["vip1"] = {"user_id": row[0], "expire_time": row[1], "active": is_expire_active(row[1])}
+        conn.close()
+    except Exception as exc:
+        log.exception("get_db_stats: %s", exc)
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(DATABASE_PATH)), "backups")
+    if os.path.isdir(backup_dir):
+        stats["backups"] = len([
+            f for f in os.listdir(backup_dir) if f.startswith("bot_data_") and f.endswith(".db")
+        ])
+    return stats
 
 
 def init_db():
@@ -210,9 +329,21 @@ def init_db():
 
 
 init_db()
+try:
+    backup_path = backup_database()
+    if backup_path:
+        log.info("Database backup: %s", backup_path)
+except Exception as exc:
+    log.warning("Database backup skipped: %s", exc)
+log.info("SQLite database: %s", os.path.abspath(DATABASE_PATH))
+if not os.path.abspath(DATABASE_PATH).startswith(os.path.abspath("/data")):
+    msg = "数据库未在 /data 持久化磁盘上，Deploy 后 VIP 与账单可能丢失。"
+    if os.environ.get("RENDER"):
+        msg += " Render Pro 也请在 Disks 挂载 /data 并设 DATABASE_PATH=/data/bot_data.db"
+    log.warning(msg)
 
 
-def get_current_time(timezone_str="Asia/Shanghai"):
+def get_current_time(timezone_str=DEFAULT_TZ):
     try:
         tz = pytz.timezone(timezone_str)
     except Exception:
@@ -232,8 +363,7 @@ def get_user_permission_level(user_id):
         row = c.fetchone()
         conn.close()
         if row:
-            expire = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-            if datetime.now() < expire:
+            if is_expire_active(row[0]):
                 lvl = row[1] or 2
                 desc = "最高级买家 (VIP1)" if lvl == 1 else "权限人 (二级VIP2)"
                 return True, desc, row[0], lvl
@@ -248,13 +378,10 @@ def add_vip_user(user_id, username, months=12, level=2):
     c = conn.cursor()
     c.execute("SELECT expire_time FROM vip_users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
-    now = datetime.now()
+    now = now_shanghai()
     if row:
-        try:
-            current = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-            base = current if current > now else now
-        except Exception:
-            base = now
+        current = parse_expire_time(row[0])
+        base = current if current and current > now else now
     else:
         base = now
     expire_str = (base + timedelta(days=30 * months)).strftime("%Y-%m-%d %H:%M:%S")
@@ -264,11 +391,29 @@ def add_vip_user(user_id, username, months=12, level=2):
     )
     conn.commit()
     conn.close()
+    log.info("VIP updated uid=%s level=%s expire=%s db=%s", user_id, level, expire_str, DATABASE_PATH)
+    try:
+        backup_database()
+    except Exception as exc:
+        log.warning("Post-VIP backup failed: %s", exc)
     return expire_str
 
 
+def get_vip1_buyer_user_id():
+    """VIP1 买家 UID（含已到期），用于续费归属判断。"""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM vip_users WHERE level = 1 LIMIT 1")
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 def get_level2_vip_count():
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now_shanghai_str()
     try:
         conn = get_db()
         c = conn.cursor()
@@ -284,7 +429,7 @@ def get_level2_vip_count():
 
 
 def get_all_level2_vips():
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now_shanghai_str()
     try:
         conn = get_db()
         c = conn.cursor()
@@ -314,7 +459,7 @@ def remove_vip_user(user_id):
 
 def get_active_vip1_buyer_id():
     """当前已购机的唯一 VIP1 买家 UID；无人购买时返回 None。"""
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now_shanghai_str()
     try:
         conn = get_db()
         c = conn.cursor()
@@ -333,10 +478,48 @@ def can_submit_purchase(user_id):
     """是否允许走购买/续费流程（本机仅一位买家，其他人需联系卖家）。"""
     if user_id in FOUNDER_USERS:
         return True
-    buyer_id = get_active_vip1_buyer_id()
-    if buyer_id is None:
-        return True
-    return user_id == buyer_id
+    active = get_active_vip1_buyer_id()
+    if active:
+        return user_id == active
+    registered = get_vip1_buyer_user_id()
+    if registered:
+        return user_id == registered
+    return True
+
+
+def build_expire_status_message(has_auth, lvl_desc, expire_time, lvl):
+    """私聊「查看到期时间」的详细说明（北京时间）。"""
+    if has_auth:
+        remain = format_expire_remaining(expire_time)
+        status = f"🟢 正常生效中（{remain}）" if remain else "🟢 正常生效中"
+        footer = (
+            "📌 到期后：群内<b>历史账单、操作人、语言设置</b>都会保留。\n"
+            "续费后立即恢复，无需重新设置。"
+        )
+    elif expire_time and expire_time not in ("未激活", "永久终身授权"):
+        status = "🔴 已到期，请续费"
+        footer = (
+            "📌 续费<b>不会删除</b>您群里的：\n"
+            "• 历史记账记录（网页账单可查）\n"
+            "• 已设群操作人\n"
+            "• 二级权限人（若未单独到期）\n"
+            "• 汇率 / 费率 / 语言等群设置\n\n"
+            "请点「自助续费说明」提交凭证，审核通过即恢复。"
+        )
+    else:
+        status = "🔴 未激活"
+        footer = (
+            "若您曾开通过却显示未激活，可能是服务器数据库被清空，"
+            "请联系创始人检查 Render 是否已挂载 Persistent Disk（/data）。"
+        )
+    expire_label = f"{expire_time}（北京时间）" if expire_time not in ("未激活", "永久终身授权") else expire_time
+    return (
+        f"👤 <b>您的身份体系：</b>\n"
+        f"• 级别：<code>{lvl_desc}</code>\n"
+        f"• 状态：{status}\n"
+        f"• 有效截止期：<code>{expire_label}</code>\n\n"
+        f"{footer}"
+    )
 
 
 def get_seller_contact_line():
@@ -1441,13 +1624,9 @@ def process_private_menu(uid, chat_id, action):
     has_auth, lvl_desc, expire_time, lvl = get_user_permission_level(uid)
 
     if action == "btn_check_expire":
-        status = "🟢 正常生效中" if has_auth else "🔴 资质已过期/未激活"
         bot.send_message(
             chat_id,
-            f"👤 <b>您的身份体系：</b>\n"
-            f"• 级别：<code>{lvl_desc}</code>\n"
-            f"• 状态：{status}\n"
-            f"• 有效截止期：<code>{expire_time}</code>",
+            build_expire_status_message(has_auth, lvl_desc, expire_time, lvl),
             parse_mode="HTML",
         )
         return None
@@ -1541,6 +1720,42 @@ def process_private_menu(uid, chat_id, action):
 # ---------------------------------------------------------------------------
 # Telegram handlers — /start
 # ---------------------------------------------------------------------------
+def can_view_dbstatus(user_id):
+    if user_id in FOUNDER_USERS:
+        return True
+    has_auth, _, _, lvl = get_user_permission_level(user_id)
+    return has_auth and lvl == 1
+
+
+@bot.message_handler(commands=["dbstatus"])
+def cmd_dbstatus(message):
+    uid = message.from_user.id
+    if not can_view_dbstatus(uid):
+        bot.reply_to(message, "⚠️ 此命令仅创始人或最高级买家可用。")
+        return
+    stats = get_db_stats()
+    vip1_line = "无"
+    if stats["vip1"]:
+        v = stats["vip1"]
+        flag = "生效中" if v["active"] else "已到期"
+        vip1_line = f"UID {v['user_id']} | {v['expire_time']} | {flag}"
+    db_path = stats["db_path"].replace("\\", "/")
+    persistent = "是 ✅" if db_path.startswith("/data/") else "否 ⚠️ 请挂载 /data 磁盘"
+    bot.reply_to(
+        message,
+        f"🗄 <b>数据库状态</b>\n"
+        f"• 路径：<code>{stats['db_path']}</code>\n"
+        f"• 持久化磁盘：{persistent}\n"
+        f"• 大小：{stats['db_size']:,} bytes\n"
+        f"• VIP 记录：{stats['vip_users']} 条\n"
+        f"• 账单：{stats['bills']} 条\n"
+        f"• 群设置：{stats['settings']} 个\n"
+        f"• 本地备份：{stats['backups']} 份\n"
+        f"• VIP1 买家：{vip1_line}",
+        parse_mode="HTML",
+    )
+
+
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     uid = message.from_user.id
@@ -1710,7 +1925,7 @@ def handle_auth_buttons(call):
     else:
         months = int(action)
         buyer_id = int(parts[2])
-        existing_buyer = get_active_vip1_buyer_id()
+        existing_buyer = get_vip1_buyer_user_id()
         if existing_buyer and existing_buyer != buyer_id:
             bot.answer_callback_query(
                 call.id,
@@ -1719,16 +1934,24 @@ def handle_auth_buttons(call):
             )
             return
         expire_str = add_vip_user(buyer_id, f"user_{buyer_id}", months, level=1)
+        stats = get_db_stats()
+        restore_note = (
+            f"\n\n📋 数据保留情况：账单 {stats['bills']} 条，"
+            f"群设置 {stats['settings']} 个，VIP {stats['vip_users']} 人。"
+        )
         try:
             bot.send_message(
                 buyer_id,
-                f"🎉 <b>最高级买家已开通 {months} 个月！</b>\n到期：{expire_str}",
+                f"🎉 <b>最高级买家已开通 {months} 个月！</b>\n"
+                f"到期：<code>{expire_str}</code>（北京时间）\n\n"
+                f"✅ 您群里的操作人、权限人与历史记账记录均已保留，可直接继续使用。"
+                f"{restore_note}",
                 parse_mode="HTML",
             )
         except Exception:
             pass
         bot.edit_message_caption(
-            f"✅ 审核成功，到期：{expire_str}",
+            f"✅ 审核成功，到期：{expire_str}（北京时间）{restore_note}",
             call.message.chat.id,
             call.message.message_id,
         )
