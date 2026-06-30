@@ -1,7 +1,16 @@
 """
-小财家记账 Telegram Bot + Flask Web 看板
-部署环境变量: TELEGRAM_TOKEN, WEBHOOK_URL, PORT (可选)
-持久化: DATABASE_PATH（Render 请挂载 Disk 到 /data 并设 DATABASE_PATH=/data/bot_data.db）
+小财家记账 Plus（增强版）Telegram Bot + Flask Web 看板
+
+在 xiaocaicai.py 基础上新增：倍数/费率/U 入款下发、回复撤销、实时汇率、群员自查等。
+
+部署环境变量:
+  TELEGRAM_TOKEN  — 请用【新 Bot】的 Token，勿与 xiaocaicai.py 共用
+  WEBHOOK_URL     — 本服务地址
+  PORT            — 端口（可选）
+  DATABASE_PATH   — 默认 bot_data_plus.db，避免与原版数据库冲突
+  PHONE_LOOKUP_URL — 可选，手机号归属地 API，用 {phone} 占位
+
+本地测试: python xiaocaicai_plus.py
 """
 
 import json
@@ -12,6 +21,8 @@ import re
 import shutil
 import sqlite3
 import io
+import ast
+import operator
 from datetime import datetime, timedelta
 
 import pytz
@@ -40,14 +51,82 @@ def _default_database_path():
     if env_path:
         return env_path
     if os.path.isdir("/data"):
-        return "/data/bot_data.db"
-    return "bot_data.db"
+        return "/data/bot_data_plus.db"
+    return "bot_data_plus.db"
 
 
 DATABASE_PATH = _default_database_path()
+PHONE_LOOKUP_URL = os.environ.get("PHONE_LOOKUP_URL", "").strip()
+
+# 身份证省级区划（GB/T 2260 前两位）
+ID_PROVINCE_MAP = {
+    "11": "北京市", "12": "天津市", "13": "河北省", "14": "山西省", "15": "内蒙古自治区",
+    "21": "辽宁省", "22": "吉林省", "23": "黑龙江省",
+    "31": "上海市", "32": "江苏省", "33": "浙江省", "34": "安徽省", "35": "福建省",
+    "36": "江西省", "37": "山东省",
+    "41": "河南省", "42": "湖北省", "43": "湖南省", "44": "广东省", "45": "广西壮族自治区",
+    "46": "海南省",
+    "50": "重庆市", "51": "四川省", "52": "贵州省", "53": "云南省", "54": "西藏自治区",
+    "61": "陕西省", "62": "甘肃省", "63": "青海省", "64": "宁夏回族自治区", "65": "新疆维吾尔自治区",
+    "71": "台湾省", "81": "香港特别行政区", "82": "澳门特别行政区",
+}
+
+# 常见身份证 6 位区划（节选，可继续扩充）
+ID_AREA_MAP = {
+    "110101": "北京市东城区", "110102": "北京市西城区", "110105": "北京市朝阳区",
+    "310101": "上海市黄浦区", "310104": "上海市徐汇区", "310115": "上海市浦东新区",
+    "440106": "广东省广州市天河区", "440304": "广东省深圳市福田区",
+    "330106": "浙江省杭州市西湖区", "320102": "江苏省南京市玄武区",
+    "510104": "四川省成都市锦江区", "420106": "湖北省武汉市武昌区",
+}
+
+# 常见银行卡 BIN（前 6 位起匹配，越长越优先）
+BANK_BIN_MAP = (
+    ("621700", "中国建设银行", "借记卡"),
+    ("622700", "中国建设银行", "借记卡"),
+    ("622848", "中国农业银行", "借记卡"),
+    ("622202", "中国工商银行", "借记卡"),
+    ("622208", "中国工商银行", "借记卡"),
+    ("621661", "中国银行", "借记卡"),
+    ("621660", "中国银行", "借记卡"),
+    ("622260", "交通银行", "借记卡"),
+    ("622588", "招商银行", "借记卡"),
+    ("621098", "中国邮政储蓄银行", "借记卡"),
+    ("622150", "中国邮政储蓄银行", "借记卡"),
+    ("622126", "中国邮政储蓄银行", "借记卡"),
+    ("622908", "兴业银行", "借记卡"),
+    ("622666", "光大银行", "借记卡"),
+    ("622622", "光大银行", "借记卡"),
+    ("622518", "浦发银行", "借记卡"),
+    ("622155", "平安银行", "借记卡"),
+    ("622568", "广发银行", "借记卡"),
+    ("622690", "中信银行", "借记卡"),
+    ("622630", "华夏银行", "借记卡"),
+)
+
+BANK_CODE_NAMES = {
+    "CCB": "中国建设银行", "ICBC": "中国工商银行", "ABC": "中国农业银行",
+    "BOC": "中国银行", "COMM": "交通银行", "PSBC": "中国邮政储蓄银行",
+    "CMB": "招商银行", "CMBC": "中国民生银行", "CIB": "兴业银行",
+    "CEB": "中国光大银行", "SPDB": "浦发银行", "PAB": "平安银行",
+    "GDB": "广发银行", "CITIC": "中信银行", "HXB": "华夏银行",
+}
+
+CARD_TYPE_NAMES = {
+    "DC": "借记卡", "CC": "信用卡", "SCC": "准贷记卡", "PC": "预付费卡",
+}
+
+# 手机号段运营商（中国大陆）
+PHONE_CARRIER_PREFIXES = (
+    (("134", "135", "136", "137", "138", "139", "147", "150", "151", "152", "157", "158", "159",
+      "172", "178", "182", "183", "184", "187", "188", "195", "197", "198"), "中国移动"),
+    (("130", "131", "132", "145", "155", "156", "166", "171", "175", "176", "185", "186", "196"), "中国联通"),
+    (("133", "149", "153", "173", "177", "180", "181", "189", "191", "193", "199"), "中国电信"),
+    (("192",), "中国广电"),
+)
 
 # ========== 品牌与价格（复制新机器人时主要改这里）==========
-BOT_NAME = "小财家"
+BOT_NAME = "小财家Plus"
 BOT_BRAND = f"{BOT_NAME}记账"
 PRICE_1_MONTH = 80
 PRICE_2_MONTH = 140
@@ -55,7 +134,7 @@ PRICE_3_MONTH = 220
 
 FOUNDER_USERS = [
     int(x.strip())
-    for x in os.environ.get("FOUNDER_USER_IDS", "8807178282").split(",")
+    for x in os.environ.get("FOUNDER_USER_IDS", "8551762310").split(",")
     if x.strip().isdigit()
 ] or [8807178282]
 # 卖家联系方式：陌生人想买第二款机器人时展示。可填用户名，或留空自动读 SELLER_USER_ID 的 @用户名
@@ -66,7 +145,34 @@ MAX_LEVEL2_VIPS = 5
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 SETTING_KEYS = {
     "operators", "exchange_rate", "fee_rate", "is_active",
-    "language", "timezone", "show_usdt", "expire_time",
+    "language", "timezone", "show_usdt", "expire_time", "extra_settings",
+}
+
+DEFAULT_EXTRA_SETTINGS = {
+    "income_exchange_rate": None,
+    "expense_exchange_rate": None,
+    "income_fee_rate": None,
+    "expense_fee_rate": None,
+    "realtime_rate_offset": 0.0,
+    "use_realtime_rate": False,
+    "payment_price": 0.0,
+    "currency": "CNY",
+    "expense_mode": "usdt",
+    "multiply_rate_mode": False,
+    "show_rmb": True,
+    "display_count": 5,
+    "time_format": "hm",
+    "pin_bills": False,
+    "day_cut_hour": None,
+    "global_day_cut_hour": None,
+    "address_detect": False,
+    "bank_detect": False,
+    "user_change_notify": False,
+    "classify_mode": "none",
+    "collection_enabled": False,
+    "collection_interval": 1,
+    "payout_addresses": [],
+    "all_operators": False,
 }
 
 if not TOKEN:
@@ -328,7 +434,23 @@ def init_db():
     conn.close()
 
 
+def migrate_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(settings)")
+    setting_cols = {row[1] for row in c.fetchall()}
+    if "extra_settings" not in setting_cols:
+        c.execute("ALTER TABLE settings ADD COLUMN extra_settings TEXT DEFAULT '{}'")
+    c.execute("PRAGMA table_info(bills)")
+    bill_cols = {row[1] for row in c.fetchall()}
+    if "source_message_id" not in bill_cols:
+        c.execute("ALTER TABLE bills ADD COLUMN source_message_id INTEGER")
+    conn.commit()
+    conn.close()
+
+
 init_db()
+migrate_db()
 try:
     backup_path = backup_database()
     if backup_path:
@@ -545,96 +667,231 @@ def build_bot_sold_message():
 
 def build_manual_guide_text(lang="zh"):
     lang = normalize_lang_code(lang)
-    c = CMD[lang]
-    brand = get_bot_brand() if lang == "zh" else get_bot_brand()
+    brand = get_bot_brand()
     short = get_bot_short_name()
+
     if lang == "eng":
         return (
-            f"📖 <b>[{brand}] User Guide (English)</b>\n\n"
-            f"🤖 Welcome to <b>{short}</b> bot.\n\n"
-            "👑 <b>Roles:</b>\n"
-            "1. <b>VIP1 buyer</b>: private menu, rename bot, set VIP2.\n"
-            "2. <b>VIP2</b>: assign group operators.\n"
-            "3. <b>Operator</b>: bookkeeping in group.\n\n"
-            f"👥 <b>Group commands</b> (English mode only):\n"
-            f"• <code>{c['class_start']}</code> / <code>{c['class_end']}</code>\n"
-            f"• <code>{c['set_operator']} @user @user2</code>\n"
-            f"• <code>{c['remove_operator']} @user</code>\n"
-            f"• <code>{c['set_rate']} 7.4</code>\n"
-            f"• <code>{c['set_fee']} 5</code>\n"
-            f"• <code>+1000</code> / <code>note+99</code>\n"
-            f"• <code>{c['expense']} 800</code>\n"
-            f"• <code>{c['bill_zero']}</code> — view bill\n"
-            f"• <code>{c['view_remark']} remark</code>\n\n"
-            f"🌐 <b>Change language:</b> <code>{c['lang_change']}</code>\n\n"
-            f"🗑️ <b>Delete:</b> <code>{c['delete_last']}</code>, "
-            f"<code>{c['delete_remark']} remark</code>, "
-            f"<code>{c['delete_today']}</code>, <code>{c['delete_all']}</code>\n\n"
-            f"🔍 <b>USDT address:</b> <code>{c['view_chain']} T...34chars</code>\n\n"
-            "🎨 <b>Private menu (VIP1):</b> rename bot / change avatar"
+            f"📖 <b>[{brand}] Full Command Guide (English)</b>\n\n"
+            f"🤖 <b>{short}</b> — tap <code>command</code> to copy.\n\n"
+            "👑 <b>Roles</b>\n"
+            "VIP1 buyer · VIP2 manager · Group operator\n\n"
+            "💰 <b>Bookkeeping</b>\n"
+            "├ Deposit <code>+10000</code>\n"
+            "├ Deposit + rate <code>+10000/7.1</code>\n"
+            "├ Deposit × multiplier <code>+10000*5</code>\n"
+            "├ Deposit × mult + rate <code>+10000*5/7.1</code>\n"
+            "├ Deposit + fee % <code>+1000*12%</code>\n"
+            "├ Deposit in USDT <code>+10000U</code>\n"
+            "├ Deposit + remark <code>+1000 remark text</code>\n"
+            "├ Payout <code>下发5000</code>\n"
+            "├ Payout × multiplier <code>下发5000*5</code>\n"
+            "├ Payout × mult + rate <code>下发5000*5/7.1</code>\n"
+            "├ Payout + rate <code>下发1000/7.8</code>\n"
+            "├ Payout in USDT <code>下发5000U</code>\n"
+            "├ View bill <code>+0</code>\n"
+            "├ Member self-check <code>账单</code> or <code>/me</code>\n"
+            "├ Start <code>开始</code> (alias: <code>上课</code>)\n"
+            "└ Stop <code>关闭</code> (alias: <code>下课</code> / <code>拉停</code>)\n\n"
+            "✏️ <b>Edits</b> (reply to a message)\n"
+            "├ Undo <code>撤销</code>\n"
+            "├ Undo deposit <code>撤销入款</code>\n"
+            "├ Undo N deposits <code>撤销入款5条</code>\n"
+            "├ Undo N payouts <code>撤销下发5条</code>\n"
+            "├ Sync bill rate <code>修改汇款10</code>\n"
+            "├ Clear today <code>删除账单</code>\n"
+            "└ Halt <code>拉停</code>\n\n"
+            "⚙️ <b>Settings</b> (operator+)\n"
+            "├ Fee <code>设置费率10</code> (negative % OK, default: income)\n"
+            "├ Income fee <code>设置入款费率10</code>\n"
+            "├ Payout fee <code>设置下发费率10</code>\n"
+            "├ Rate <code>设置汇率8</code>\n"
+            "├ Income rate <code>设置入款汇率8</code>\n"
+            "├ Payout rate <code>设置下发汇率8</code>\n"
+            "├ Live rate <code>设置实时汇率</code>\n"
+            "├ Live rate offset <code>设置实时汇率-1</code>\n"
+            "├ Payout price <code>设置代付价格10</code>\n"
+            "├ Currency <code>设置币种HKD</code>\n"
+            "├ Payout mode <code>设置下发人民币模式</code> / <code>设置下发币模式</code>\n"
+            "├ Rate mode <code>开启乘汇率模式</code> / <code>关闭乘汇率模式</code>\n"
+            "├ Show RMB <code>显示人民币</code> / <code>隐藏人民币</code>\n"
+            "├ List lines <code>显示条数10</code>\n"
+            "├ Time format <code>显示分秒</code> / <code>显示时分秒</code>\n"
+            "├ Pin report <code>开启记账置顶</code> / <code>关闭记账置顶</code>\n"
+            "├ Pin message <code>置顶</code> / <code>取消置顶</code> (reply)\n"
+            "├ Day cut <code>设置日切04</code>\n"
+            "├ Global day cut <code>设置全局日切04</code>\n"
+            "├ Off day cut <code>关闭日切</code> / <code>关闭全局日切</code>\n"
+            "├ Address detect <code>开启地址识别</code> / <code>关闭地址识别</code>\n"
+            "├ Bank detect <code>开启银行卡自动识别</code> / <code>关闭银行卡识别</code>\n"
+            "├ Member alerts <code>开启用户变更通知</code> / <code>关闭用户变更通知</code>\n"
+            "├ Notify all <code>通知所有人</code>\n"
+            "├ Categories <code>开启操作人分类</code> / <code>开启回复人分类</code> / <code>关闭分类</code>\n"
+            "├ Collection <code>开启催收</code> / <code>关闭催收</code> / <code>催收1</code> (minutes)\n"
+            "├ Payout addresses <code>设置下发地址{addr}</code> / <code>删除下发地址{addr}</code>\n"
+            "├ Add operator <code>设置操作人@user</code> (or reply + command)\n"
+            "├ Remove operator <code>移除操作人@user</code>\n"
+            "└ All operators <code>设置所有人</code> / <code>取消所有人</code>\n\n"
+            "🔍 <b>Lookup</b>\n"
+            "├ Current rate <code>汇率</code>\n"
+            "├ OKX OTC <code>Z0</code>\n"
+            "├ Huobi OTC <code>H0</code>\n"
+            "├ MYR OTC <code>m0</code>\n"
+            "├ Bybit MMK quick <code>mm0</code> · all <code>bma</code>\n"
+            "├ Bybit KBZPay <code>bkb</code> · Mobile Banking <code>bmm</code>\n"
+            "├ OKX all buy <code>la</code> · bank buy <code>lk</code> · Alipay buy <code>lz</code> · WeChat buy <code>lw</code>\n"
+            "├ OKX bank sell <code>lmk</code> · Alipay sell <code>lmz</code> · WeChat sell <code>lmw</code>\n"
+            "├ Convert <code>查汇率100</code>\n"
+            "├ Point calc <code>币价100 汇率10</code>\n"
+            "├ Phone <code>查询13800138000</code> — carrier/location\n"
+            "├ Bank card <code>查询6217001234567890</code> — issuer/type\n"
+            "├ ID card <code>查询110101199001011234</code> — region/birth/gender\n"
+            "└ USDT TRC20 — send address or <code>查看 T...34chars</code>\n\n"
+            "🎨 <b>Private (VIP1):</b> rename bot · change avatar · VIP2 · renew"
         )
+
     if lang == "my":
         return (
-            f"📖 <b>[{brand}] အသုံးပြုလမ်းညွှန် (Myanmar)</b>\n\n"
-            f"🤖 <b>{short}</b> bot ကို ကြိုဆိုပါသည်。\n\n"
-            "👑 <b>အခန်းကဏ္ဍ：</b>\n"
-            "1. <b>VIP1 buyer</b>：private menu、bot အမည်ပြောင်း、VIP2 သတ်မှတ်\n"
-            "2. <b>VIP2</b>：operator သတ်မှတ်\n"
-            "3. <b>Operator</b>：အုပ်စုတွင်မှတ်တမ်းတင်\n\n"
-            f"👥 <b>အုပ်စုအမိန့်</b>（Myanmar mode သာ）：\n"
-            f"• <code>{c['class_start']}</code> / <code>{c['class_end']}</code>\n"
-            f"• <code>{c['set_operator']} @user</code>\n"
-            f"• <code>{c['remove_operator']} @user</code>\n"
-            f"• <code>{c['set_rate']} 7.4</code>\n"
-            f"• <code>{c['set_fee']} 5</code>\n"
-            f"• <code>+1000</code> / <code>note+99</code>\n"
-            f"• <code>{c['expense']} 800</code>\n"
-            f"• <code>{c['bill_zero']}</code>\n"
-            f"• <code>{c['view_remark']} remark</code>\n\n"
-            f"🌐 <b>ဘာသာပြောင်း：</b> <code>{c['lang_change']}</code>\n\n"
-            f"🗑️ <b>ဖျက်ရန်：</b> <code>{c['delete_last']}</code>, "
-            f"<code>{c['delete_remark']} remark</code>, "
-            f"<code>{c['delete_today']}</code>, <code>{c['delete_all']}</code>\n\n"
-            f"🔍 <b>USDT：</b> <code>{c['view_chain']} T...34chars</code>\n\n"
-            "🎨 <b>Private (VIP1)：</b> bot အမည်/avatar"
+            f"📖 <b>[{brand}] အမိန့်စာရင်း (Myanmar)</b>\n\n"
+            f"🤖 <b>{short}</b> — <code>command</code> ကို နှိပ်ပြီး copy လုပ်နိုင်သည်。\n\n"
+            "👑 <b>အခန်းကဏ္ဍ</b>\n"
+            "VIP1 buyer · VIP2 · Operator\n\n"
+            "💰 <b>မှတ်တမ်းတင်</b>\n"
+            "├ ဝင်ငွေ <code>+10000</code>\n"
+            "├ နှုန်းနှင့်ဝင်ငွေ <code>+10000/7.1</code>\n"
+            "├ မြှောက်ချက် <code>+10000*5</code>\n"
+            "├ မြှောက်+နှုန်း <code>+10000*5/7.1</code>\n"
+            "├ အခကြေးနှုန်း <code>+1000*12%</code>\n"
+            "├ USDT ဝင်ငွေ <code>+10000U</code>\n"
+            "├ မှတ်ချက်ပါ <code>+1000 မှတ်ချက်</code>\n"
+            "├ ထုတ်ပေးမှု <code>下发5000</code>\n"
+            "├ ထုတ်×မြှောက် <code>下发5000*5</code>\n"
+            "├ ထုတ်×မြှောက်+နှုန်း <code>下发5000*5/7.1</code>\n"
+            "├ ထုတ်+နှုန်း <code>下发1000/7.8</code>\n"
+            "├ USDT ထုတ် <code>下发5000U</code>\n"
+            "├ ဘီလ်ကြည့် <code>+0</code>\n"
+            "├ ကိုယ်တိုင်ကြည့် <code>账单</code> / <code>/me</code>\n"
+            "├ စတင် <code>开始</code>（<code>上课</code>）\n"
+            "└ ပိတ် <code>关闭</code>（<code>下课</code> / <code>拉停</code>）\n\n"
+            "✏️ <b>ပြင်ဆင်</b>（မက်ဆေ့ချ်ကို reply）\n"
+            "├ ပယ်ဖျက် <code>撤销</code>\n"
+            "├ ဝင်ငွေပယ် <code>撤销入款</code>\n"
+            "├ ဝင်ငွေ N ခုပယ် <code>撤销入款5条</code>\n"
+            "├ ထုတ် N ခုပယ် <code>撤销下发5条</code>\n"
+            "├ နှုန်းညှိ <code>修改汇款10</code>\n"
+            "├ ယနေ့ဖျက် <code>删除账单</code>\n"
+            "└ ရပ်တန့် <code>拉停</code>\n\n"
+            "⚙️ <b>ဆettings</b>\n"
+            "├ အခကြေးငွေ <code>设置费率10</code>\n"
+            "├ ဝင်ငွေအခကြေး <code>设置入款费率10</code>\n"
+            "├ ထုတ်အခကြေး <code>设置下发费率10</code>\n"
+            "├ နှုန်းထား <code>设置汇率8</code>\n"
+            "├ ဝင်ငွေနှုန်း <code>设置入款汇率8</code>\n"
+            "├ ထုတ်နှုန်း <code>设置下发汇率8</code>\n"
+            "├ Live နှုန်း <code>设置实时汇率</code> / <code>设置实时汇率-1</code>\n"
+            "├ Operator <code>设置操作人@user</code>\n"
+            "├ Operator ဖယ် <code>移除操作人@user</code>\n"
+            "└ အားလုံး <code>设置所有人</code> / <code>取消所有人</code>\n\n"
+            "🔍 <b>ရှာဖွေ</b>\n"
+            "├ နှုန်း <code>汇率</code> · OKX <code>Z0</code> · Huobi <code>H0</code> · MYR <code>m0</code>\n"
+            "├ MMK <code>mm0</code> · all <code>bma</code> · KBZ <code>bkb</code> · Mobile <code>bmm</code>\n"
+            "├ OKX buy all <code>la</code> · bank <code>lk</code> · Alipay <code>lz</code> · WeChat <code>lw</code>\n"
+            "├ OKX sell bank <code>lmk</code> · Alipay <code>lmz</code> · WeChat <code>lmw</code>\n"
+            "├ ပြောင်း <code>查汇率100</code> · <code>币价100 汇率10</code>\n"
+            "├ ဖုန်း <code>查询13800138000</code> သို့မဟုတ် 11 လုံး ပို့ပါ\n"
+            "├ ဘဏ်ကတ် <code>查询6217001234567890</code>\n"
+            "├ မှတ်ပုံ <code>查询110101199001011234</code>\n"
+            "└ USDT TRC20 လိပ်စာ ပို့ပါ\n\n"
+            "🎨 <b>Private VIP1:</b> bot အမည်/avatar · VIP2 · သက်တမ်းတိုး"
         )
+
     return (
-        f"📖 <b>【{get_bot_brand()}】全功能业务操作指南</b>\n\n"
-        f"🤖 欢迎使用 <b>{get_bot_short_name()}</b> 机器人，以下为常用指令：\n\n"
-        "👑 <b>权限架构：</b>\n"
-        "1. <b>最高级买家</b>：私聊菜单，可改机器人名字/头像，可指派二级权限人。\n"
-        "2. <b>权限人(VIP2)</b>：可进群指派群操作人。\n"
-        "3. <b>操作人</b>：群内专职记账。\n\n"
-        f"👥 <b>群内指令集</b>（中文模式专用）：\n"
-        f"• <code>{c['class_start']}</code> / <code>{c['class_end']}</code> — 开启或封存今日记账\n"
-        f"• <code>{c['set_operator']} @用户名 @用户名2</code> — 可一次设置多个\n"
-        f"• <code>{c['remove_operator']} @用户名</code>\n"
-        f"• <code>{c['set_rate']} 7.4</code>\n"
-        f"• <code>{c['set_fee']} 5</code> — 费率 5 表示 5%\n"
-        f"• <code>+1000</code> / <code>老弟+99</code> — 记入款\n"
-        f"• <code>+1000/7.3</code> — 指定汇率入款\n"
-        f"• <code>{c['expense']} 800</code> — 记下发（USDT）\n"
-        f"• <code>{c['bill_zero']}</code> — 查看今日账单\n"
-        f"• <code>{c['view_remark']} 备注名</code> — 查看某备注今日明细\n\n"
-        f"🌐 <b>切换群语言</b>（买家/权限人）：<code>{c['lang_change']}</code>\n\n"
-        f"🗑️ <b>删账命令</b>（需操作权限）：\n"
-        f"• <code>{c['delete_last']}</code> — 撤销最近一笔\n"
-        f"• <code>{c['delete_remark']} 备注名</code> — 删当天该备注的所有进单\n"
-        f"• <code>{c['delete_today']}</code> — 清空本群今日账单\n"
-        f"• <code>{c['delete_all']}</code> — 清空本群全部历史账单\n\n"
-        f"🔍 <b>查询 USDT 地址</b>（群/私聊均可）：\n"
-        f"• <code>{c['view_chain']} T开头的34位波场地址</code>\n"
-        f"• 例：<code>{c['view_chain']} TVnjLwDrGjYVRTa1ukfoE2mFTmCxtrjoCw</code>\n"
-        f"• （群内 <code>{c['view_remark']} 备注名</code> 为查进单，不是查链上地址）\n\n"
-        "🎨 <b>买家专属（私聊菜单）：</b>\n"
-        "• <b>改机器人名字</b> / <b>改机器人头像</b>（仅最高级买家）"
+        f"📖 <b>【{brand}】全功能指令说明</b>\n\n"
+        f"🤖 欢迎使用 <b>{short}</b>，点击下方 <code>指令</code> 可复制。\n\n"
+        "👑 <b>权限架构</b>\n"
+        "最高级买家 · 二级权限人 · 群操作人\n\n"
+        "💰 <b>记账操作</b>（点击可复制）\n"
+        "├ 入款 <code>+10000</code>\n"
+        "├ 入款+汇率 <code>+10000/7.1</code>\n"
+        "├ 入款+倍数 <code>+10000*5</code>\n"
+        "├ 入款+倍数+汇率 <code>+10000*5/7.1</code>\n"
+        "├ 入款+费率 <code>+1000*12%</code>\n"
+        "├ 入款U <code>+10000U</code>\n"
+        "├ 入款备注 <code>+1000 备注内容</code>\n"
+        "├ 下发 <code>下发5000</code>\n"
+        "├ 下发+倍数 <code>下发5000*5</code>\n"
+        "├ 下发+倍数+汇率 <code>下发5000*5/7.1</code>\n"
+        "├ 下发+汇率 <code>下发1000/7.8</code>\n"
+        "├ 下发U <code>下发5000U</code>\n"
+        "├ 查账单 <code>+0</code>\n"
+        "├ 群员自查 <code>账单</code> 或 <code>/我</code>\n"
+        "├ 开始记账 <code>开始</code>（兼容 <code>上课</code>）\n"
+        "└ 停止记账 <code>关闭</code>（兼容 <code>下课</code> / <code>拉停</code>）\n\n"
+        "✏️ <b>修改操作</b>\n"
+        "├ 撤销（回复消息）<code>撤销</code>\n"
+        "├ 撤销入款（回复消息）<code>撤销入款</code>\n"
+        "├ 撤销多条入款（回复消息）<code>撤销入款5条</code>\n"
+        "├ 撤销多条下发（回复消息）<code>撤销下发5条</code>\n"
+        "├ 修改汇款 <code>修改汇款10</code>（同步更新账单汇率）\n"
+        "├ 清空账单 <code>删除账单</code>\n"
+        "└ 拉停 <code>拉停</code>\n\n"
+        "⚙️ <b>设置操作</b>（需操作权限）\n"
+        "├ 设置费率 <code>设置费率10</code>（支持负数%，默认入款）\n"
+        "├ 设置入款费率 <code>设置入款费率10</code>\n"
+        "├ 设置下发费率 <code>设置下发费率10</code>\n"
+        "├ 设置汇率 <code>设置汇率8</code>（支持负数%，默认入款）\n"
+        "├ 设置入款汇率 <code>设置入款汇率8</code>\n"
+        "├ 设置下发汇率 <code>设置下发汇率8</code>\n"
+        "├ 同步实时汇率 <code>设置实时汇率</code>\n"
+        "├ 同步实时汇率偏移 <code>设置实时汇率-1</code>\n"
+        "├ 设置代付价格 <code>设置代付价格10</code>\n"
+        "├ 设置币种 <code>设置币种HKD</code>\n"
+        "├ 下发模式 <code>设置下发人民币模式</code> / <code>设置下发币模式</code>\n"
+        "├ 汇率模式 <code>开启乘汇率模式</code> / <code>关闭乘汇率模式</code>\n"
+        "├ 人民币显示 <code>显示人民币</code> / <code>隐藏人民币</code>\n"
+        "├ 显示条数 <code>显示条数10</code>\n"
+        "├ 时间格式 <code>显示分秒</code> / <code>显示时分秒</code>\n"
+        "├ 记账置顶 <code>开启记账置顶</code> / <code>关闭记账置顶</code>\n"
+        "├ 置顶消息 <code>置顶</code> / <code>取消置顶</code>（回复消息）\n"
+        "├ 日切 <code>设置日切04</code>（4 点换日归属）\n"
+        "├ 全局日切 <code>设置全局日切04</code>\n"
+        "├ 关闭日切 <code>关闭日切</code> / <code>关闭全局日切</code>\n"
+        "├ 地址识别 <code>开启地址识别</code> / <code>关闭地址识别</code>\n"
+        "├ 银行卡识别 <code>开启银行卡自动识别</code> / <code>关闭银行卡识别</code>\n"
+        "├ 变更通知 <code>开启用户变更通知</code> / <code>关闭用户变更通知</code>\n"
+        "├ 通知所有人 <code>通知所有人</code>\n"
+        "├ 分类 <code>开启操作人分类</code> / <code>开启回复人分类</code> / <code>关闭分类</code>\n"
+        "├ 催收 <code>开启催收</code> / <code>关闭催收</code> / <code>催收1</code>（分钟）\n"
+        "├ 下发地址 <code>设置下发地址{地址}</code> / <code>删除下发地址{地址}</code>\n"
+        "├ 增加记员 <code>设置操作人@xxxx</code>（或回复消息发设置操作人）\n"
+        "├ 移除记员 <code>移除操作人@xxxx</code>\n"
+        "└ 全部记员 <code>设置所有人</code> / <code>取消所有人</code>\n\n"
+        "🔍 <b>查询操作</b>\n"
+        "├ 查汇率 <code>汇率</code>\n"
+        "├ 欧易汇率 <code>Z0</code>\n"
+        "├ 火币汇率 <code>H0</code>\n"
+        "├ 马币汇率 <code>m0</code>\n"
+        "├ 缅币快查 <code>mm0</code>（Bybit P2P）\n"
+        "├ 缅币全部买价 <code>bma</code>（KBZ + Mobile Banking）\n"
+        "├ KBZ 买U Top10 <code>bkb</code>\n"
+        "├ Mobile Banking 买U Top10 <code>bmm</code>\n"
+        "├ 欧易全部买价 <code>la</code>\n"
+        "├ 欧易银行卡买价 <code>lk</code> · 支付宝买价 <code>lz</code> · 微信买价 <code>lw</code>\n"
+        "├ 欧易银行卡卖价 <code>lmk</code> · 支付宝卖价 <code>lmz</code> · 微信卖价 <code>lmw</code>\n"
+        "├ 查汇率换算 <code>查汇率100</code>\n"
+        "├ 点位计算 <code>币价100 汇率10</code>\n"
+        "├ 查手机号 <code>查询13800138000</code> — 运营商/归属地\n"
+        "├ 查银行卡 <code>查询6217001234567890</code> — 发卡行/卡类型\n"
+        "├ 查身份证 <code>查询110101199001011234</code> — 归属地/生日/性别\n"
+        "└ 查地址 发送 USDT TRC20 地址，或 <code>查看 T开头34位地址</code>\n\n"
+        "🎨 <b>私聊菜单（VIP1）：</b>改名字 · 改头像 · 设权限人 · 续费"
     )
 
 
 def get_setting(group_id, key):
     cols = [
         "group_id", "operators", "exchange_rate", "fee_rate", "is_active",
-        "language", "timezone", "show_usdt", "expire_time",
+        "language", "timezone", "show_usdt", "expire_time", "extra_settings",
     ]
     try:
         conn = get_db()
@@ -645,15 +902,20 @@ def get_setting(group_id, key):
             _, _, init_time = get_current_time()
             c.execute(
                 "INSERT OR IGNORE INTO settings "
-                "(group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) "
-                "VALUES (?, '[]', 7.2, 0, 1, 'zh', 'Asia/Shanghai', 1, ?)",
+                "(group_id, operators, exchange_rate, fee_rate, is_active, language, "
+                "timezone, show_usdt, expire_time, extra_settings) "
+                "VALUES (?, '[]', 7.2, 0, 1, 'zh', 'Asia/Shanghai', 1, ?, '{}')",
                 (group_id, init_time),
             )
             conn.commit()
             c.execute("SELECT * FROM settings WHERE group_id = ?", (group_id,))
             row = c.fetchone()
         conn.close()
-        return dict(zip(cols, row)).get(key)
+        if not row:
+            return None
+        # 兼容旧库列数不足时仍可读前几列
+        mapped = dict(zip(cols, row[: len(cols)]))
+        return mapped.get(key)
     except Exception:
         return None
 
@@ -681,15 +943,121 @@ def normalize_billing_text(text):
     return text
 
 
+_CALC_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _normalize_calc_expression(text):
+    t = normalize_billing_text(text).strip()
+    for src, dst in (
+        ("×", "*"), ("✕", "*"), ("⨉", "*"), ("·", "*"),
+        ("÷", "/"), ("／", "/"), ("＊", "*"),
+        ("x", "*"), ("X", "*"),
+    ):
+        t = t.replace(src, dst)
+    return re.sub(r"\s+", "", t)
+
+
+def _safe_eval_calc(expr):
+    def _eval_node(node):
+        if isinstance(node, ast.Expression):
+            return _eval_node(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("unsupported constant")
+        num_type = getattr(ast, "Num", None)
+        if num_type is not None and isinstance(node, num_type):
+            return node.n
+        if isinstance(node, ast.UnaryOp):
+            op = _CALC_BIN_OPS.get(type(node.op))
+            if op is None:
+                raise ValueError("unsupported unary op")
+            return op(_eval_node(node.operand))
+        if isinstance(node, ast.BinOp):
+            op = _CALC_BIN_OPS.get(type(node.op))
+            if op is None:
+                raise ValueError("unsupported binary op")
+            return op(_eval_node(node.left), _eval_node(node.right))
+        raise ValueError("unsupported expression")
+
+    tree = ast.parse(expr, mode="eval")
+    return _eval_node(tree)
+
+
+def _format_calc_result(value):
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, float):
+        text = f"{value:.8f}".rstrip("0").rstrip(".")
+        return text or "0"
+    return str(value)
+
+
+def is_pure_arithmetic_expression(text):
+    """纯数字算式（如 500+300、5000/5），不是 +100 这类记账指令。"""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 80:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", raw):
+        return False
+    if re.match(
+        r"^(设置|查询|删除|开启|关闭|改语言|通知|上课|下课|开始|拉停|撤销|查汇率|币价|汇率$|/|@)",
+        raw,
+    ):
+        return False
+    if re.match(r"^[a-zA-Z]", raw):
+        return False
+    # +100、+0、-50 等是记账，不是计算器
+    if re.match(r"^[+\-]\d", raw):
+        return False
+    expr = _normalize_calc_expression(raw)
+    if not expr or not re.search(r"[\+\-\*/]", expr):
+        return False
+    if not re.fullmatch(r"[\d+\-*/().]+", expr):
+        return False
+    if len(re.findall(r"\d+\.?\d*", expr)) < 2:
+        return False
+    if expr.lstrip("+-").isdigit() and len(re.sub(r"\D", "", expr)) >= 11:
+        return False
+    return True
+
+
+def try_reply_calculator(message, text):
+    if not is_pure_arithmetic_expression(text):
+        return False
+    expr = _normalize_calc_expression(text)
+    show_expr = (text or "").strip()
+    try:
+        result = _safe_eval_calc(expr)
+    except Exception as exc:
+        log.warning("calculator failed expr=%r: %s", expr, exc)
+        bot.reply_to(message, f"🧮 算式无法计算：<code>{_html_esc(show_expr)}</code>")
+        return True
+    bot.reply_to(
+        message,
+        f"🧮 机器人计算 = <b>{_format_calc_result(result)}</b>\n"
+        f"<code>{_html_esc(show_expr)}</code>",
+        parse_mode="HTML",
+    )
+    return True
+
+
 def looks_like_billing_command(text, group_id):
     text = normalize_billing_text(text)
     if text == cmd(group_id, "bill_zero"):
         return True
-    if match_exact(text, group_id, "class_start") or match_exact(text, group_id, "class_end"):
+    if match_class_start(text, group_id) or match_class_end(text, group_id):
         return True
-    if re.match(r"^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$", text):
+    if parse_income_command(text, group_id):
         return True
-    if expense_match(text, group_id):
+    if parse_expense_command(text, group_id):
         return True
     return False
 
@@ -719,6 +1087,8 @@ TEXTS = {
         "total_income": "<b>总入款:</b> {amount}",
         "fee_rate_label": "<b>费率:</b> {rate}%",
         "exchange_rate_label": "<b>汇率:</b> {rate}",
+        "income_rate_label": "<b>入款汇率:</b> {rate}",
+        "expense_rate_label": "<b>下发汇率:</b> {rate}",
         "should_issue": "应下发: {amount} U",
         "issued": "已下发: {amount} U",
         "not_issued": "未下发: {amount} U",
@@ -748,10 +1118,18 @@ TEXTS = {
         "view_remark_total": "合计 {rmb} RMB / {usdt} USDT",
         "bill_fail": "❌ 记账失败: {err}",
         "lang_label": "中文",
+        "lang_active_hint": (
+            "记账仍处于开启状态，可继续使用 <code>+0</code> 查账、<code>+金额</code> 入款等指令。"
+            "开关记账：<code>上课</code> / <code>开始</code> / <code>start</code>。"
+        ),
     },
     "eng": {
         "lang_picker": "🌐 Choose group language:",
         "lang_changed": "✅ Language updated: <b>{label}</b>",
+        "lang_active_hint": (
+            "Bookkeeping is still ON. Use <code>+0</code> for summary, <code>+amount</code> for deposits. "
+            "Toggle: <code>start</code> / <code>上课</code> / <code>开始</code>."
+        ),
         "welcome_thanks": "Thank you for adding me to your group!",
         "welcome_i_am": "I am {name} 🤖",
         "welcome_start": "Send <code>上课</code> to start, set fee rate (e.g. <code>设置费率 5</code>), then begin bookkeeping.",
@@ -767,6 +1145,8 @@ TEXTS = {
         "total_income": "<b>Total deposit:</b> {amount}",
         "fee_rate_label": "<b>Fee:</b> {rate}%",
         "exchange_rate_label": "<b>Rate:</b> {rate}",
+        "income_rate_label": "<b>Deposit rate:</b> {rate}",
+        "expense_rate_label": "<b>Payout rate:</b> {rate}",
         "should_issue": "To issue: {amount} U",
         "issued": "Issued: {amount} U",
         "not_issued": "Remaining: {amount} U",
@@ -815,6 +1195,8 @@ TEXTS = {
         "total_income": "<b>စုဝင်ငွေ:</b> {amount}",
         "fee_rate_label": "<b>အခကြေးငွေ:</b> {rate}%",
         "exchange_rate_label": "<b>နှုန်းထား:</b> {rate}",
+        "income_rate_label": "<b>ဝင်ငွေနှုန်း:</b> {rate}",
+        "expense_rate_label": "<b>ထုတ်နှုန်း:</b> {rate}",
         "should_issue": "ထုတ်ပေးရန်: {amount} U",
         "issued": "ထုတ်ပေးပြီး: {amount} U",
         "not_issued": "မထုတ်ရသေး: {amount} U",
@@ -844,6 +1226,10 @@ TEXTS = {
         "view_remark_total": "စုစုပေါင်း {rmb} RMB / {usdt} USDT",
         "bill_fail": "❌ မအောင်မြင်: {err}",
         "lang_label": "Myanmar",
+        "lang_active_hint": (
+            "မှတ်တမ်းတင်ခြင်း ဆက်ဖွင့်ထားသည်။ <code>+0</code> ဖြင့် ကြည့်နိုင်သည်။ "
+            "<code>上课</code> / <code>start</code> ဖြင့် ဖွင့်/ပိတ်နိုင်သည်。"
+        ),
     },
 }
 
@@ -862,6 +1248,7 @@ CMD = {
         "set_operator": "设置操作人",
         "remove_operator": "取掉操作人",
         "remove_operator2": "取消操作人",
+        "remove_operator3": "移除操作人",
         "delete_last": "删最后",
         "delete_today": "删今天",
         "delete_all": "删全部",
@@ -919,6 +1306,40 @@ def cmd(group_id, key):
     return cmd_lang(get_group_lang(group_id), key)
 
 
+def cmd_variants(key):
+    """某命令在所有语言下的别名（改语言后仍全部有效）。"""
+    seen = set()
+    for lang in SUPPORTED_LANGS:
+        val = CMD.get(lang, {}).get(key)
+        if val:
+            seen.add(val)
+    return seen
+
+
+def is_group_active(group_id):
+    try:
+        return int(get_setting(group_id, "is_active") or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def strip_cmd_prefix_any(text, key):
+    raw = (text or "").strip()
+    for prefix in sorted(cmd_variants(key), key=len, reverse=True):
+        rest = strip_cmd_prefix(raw, prefix)
+        if rest is not None:
+            return rest
+    return None
+
+
+def find_cmd_prefix(text, key):
+    raw = (text or "").strip()
+    for prefix in sorted(cmd_variants(key), key=len, reverse=True):
+        if strip_cmd_prefix(raw, prefix) is not None:
+            return prefix
+    return None
+
+
 def strip_cmd_prefix(text, prefix):
     raw = (text or "").strip()
     if raw == prefix:
@@ -931,7 +1352,7 @@ def strip_cmd_prefix(text, prefix):
 
 
 def match_exact(text, group_id, key):
-    return (text or "").strip() == cmd(group_id, key)
+    return (text or "").strip() in cmd_variants(key)
 
 
 def build_welcome_start(group_id):
@@ -939,17 +1360,17 @@ def build_welcome_start(group_id):
     lang = get_group_lang(group_id)
     if lang == "eng":
         return (
-            f"Send <code>{c['class_start']}</code> to enable bookkeeping, "
-            f"set fee (e.g. <code>{c['set_fee']} 5</code>), then you can start."
+            f"Send <code>{c['class_start']}</code> / <code>上课</code> / <code>开始</code> to enable bookkeeping, "
+            f"set fee (e.g. <code>{c['set_fee']} 5</code> or <code>设置费率 5</code>), then you can start."
         )
     if lang == "my":
         return (
-            f"<code>{c['class_start']}</code> ပို့၍ စတင်ပါ၊ "
-            f"<code>{c['set_fee']} 5</code> ဖြင့် အခကြေးငွေသတ်မှတ်ပါ。"
+            f"<code>{c['class_start']}</code> / <code>上课</code> / <code>开始</code> ပို့၍ စတင်ပါ၊ "
+            f"<code>{c['set_fee']} 5</code> / <code>设置费率 5</code> ဖြင့် အခကြေးငွေသတ်မှတ်ပါ。"
         )
     return (
-        f"请发送 <code>{c['class_start']}</code> 唤醒我，"
-        f"并设置费率（如 <code>{c['set_fee']} 5</code>），然后即可开始记账。"
+        f"请发送 <code>{c['class_start']}</code> / <code>开始</code> / <code>start</code> 唤醒我，"
+        f"并设置费率（如 <code>{c['set_fee']} 5</code> / <code>设置费率 5</code>），然后即可开始记账。"
     )
 
 
@@ -957,10 +1378,17 @@ def build_need_class_start(group_id):
     c = CMD[get_group_lang(group_id)]
     lang = get_group_lang(group_id)
     if lang == "eng":
-        return f"⚠️ Send <code>{c['class_start']}</code> first to enable bookkeeping."
+        return (
+            f"⚠️ Send <code>{c['class_start']}</code> / <code>上课</code> / <code>开始</code> "
+            f"first to enable bookkeeping."
+        )
     if lang == "my":
-        return f"⚠️ ဦးစွာ <code>{c['class_start']}</code> ပို့ပါ。"
-    return f"⚠️ 请先发送 <code>{c['class_start']}</code> 开启记账。"
+        return (
+            f"⚠️ ဦးစွာ <code>{c['class_start']}</code> / <code>上课</code> / <code>开始</code> ပို့ပါ。"
+        )
+    return (
+        f"⚠️ 请先发送 <code>{c['class_start']}</code> / <code>开始</code> / <code>上课</code> / <code>start</code> 开启记账。"
+    )
 
 
 def expense_match(text, group_id):
@@ -1146,7 +1574,7 @@ def tr(group_id, key, **kwargs):
 
 def is_language_change_trigger(text, group_id):
     raw = (text or "").strip()
-    if raw == cmd(group_id, "lang_change"):
+    if raw in cmd_variants("lang_change") or raw == "改语言":
         return True
     low = raw.lower()
     return low.startswith("/setlanguage") or low.startswith("setlanguage")
@@ -1186,7 +1614,10 @@ def apply_group_language(chat_id, group_id, lang_code):
     update_setting(group_id, "language", lang_code)
     label = TEXTS[lang_code]["lang_label"]
     bot.send_message(chat_id, tr(group_id, "lang_changed", label=label), parse_mode="HTML")
-    send_group_greeting(chat_id, group_id)
+    if is_group_active(group_id):
+        bot.send_message(chat_id, tr(group_id, "lang_active_hint"), parse_mode="HTML")
+    else:
+        send_group_greeting(chat_id, group_id)
 
 
 def normalize_operator_name(name):
@@ -1204,6 +1635,9 @@ def get_group_operators(group_id):
 
 
 def can_operate_in_group(group_id, user_id, tg_username=None):
+    extra = get_extra_settings(group_id)
+    if extra.get("all_operators"):
+        return True
     has_auth, _, _, _ = get_user_permission_level(user_id)
     if has_auth:
         return True
@@ -1318,25 +1752,1448 @@ def parse_operator_targets(text, entities, command_prefix):
 
 
 # ---------------------------------------------------------------------------
+# Extended settings & advanced billing
+# ---------------------------------------------------------------------------
+def get_extra_settings(group_id):
+    raw = get_setting(group_id, "extra_settings") or "{}"
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+    merged = dict(DEFAULT_EXTRA_SETTINGS)
+    merged.update({k: v for k, v in data.items() if k in DEFAULT_EXTRA_SETTINGS})
+    return merged
+
+
+def save_extra_settings(group_id, data):
+    merged = dict(DEFAULT_EXTRA_SETTINGS)
+    merged.update({k: v for k, v in data.items() if k in DEFAULT_EXTRA_SETTINGS})
+    update_setting(group_id, "extra_settings", json.dumps(merged, ensure_ascii=False))
+
+
+def apply_expense_exchange_rate(group_id, rate):
+    """原子写入：下发汇率 + 人民币下发模式。"""
+    data = get_extra_settings(group_id)
+    data["expense_exchange_rate"] = float(rate)
+    data["expense_mode"] = "rmb"
+    save_extra_settings(group_id, data)
+
+
+def expense_amount_is_rmb(extra, inline_rate, is_usdt_input):
+    """下发金额是否按人民币除以汇率换算成 U。"""
+    if is_usdt_input:
+        return False
+    if inline_rate is not None:
+        return True
+    return (extra.get("expense_mode") or "usdt") == "rmb"
+
+
+def update_extra_setting(group_id, key, value):
+    if key not in DEFAULT_EXTRA_SETTINGS:
+        return
+    data = get_extra_settings(group_id)
+    data[key] = value
+    save_extra_settings(group_id, data)
+
+
+def get_effective_rate(group_id, bill_type="income"):
+    extra = get_extra_settings(group_id)
+    if bill_type == "income":
+        rate = extra.get("income_exchange_rate")
+    else:
+        rate = extra.get("expense_exchange_rate")
+    if rate is not None:
+        return float(rate)
+    if extra.get("use_realtime_rate"):
+        base = fetch_okx_usdt_cny_rate()
+        if base:
+            return max(base + float(extra.get("realtime_rate_offset") or 0), 0.01)
+    return float(get_setting(group_id, "exchange_rate") or 7.2)
+
+
+def get_effective_fee(group_id, bill_type="income", override_pct=None):
+    if override_pct is not None:
+        return float(override_pct) / 100.0
+    extra = get_extra_settings(group_id)
+    if bill_type == "income":
+        fee = extra.get("income_fee_rate")
+    else:
+        fee = extra.get("expense_fee_rate")
+    if fee is None:
+        fee = get_setting(group_id, "fee_rate") or 0.0
+    return float(fee)
+
+
+def get_billing_date_str(group_id):
+    extra = get_extra_settings(group_id)
+    cut = extra.get("day_cut_hour")
+    if cut is None:
+        cut = extra.get("global_day_cut_hour")
+    tz = get_setting(group_id, "timezone") or "Asia/Shanghai"
+    now, _, full_time = get_current_time(tz)
+    if cut is not None:
+        try:
+            cut_h = int(cut)
+            if now.hour < cut_h:
+                now = now - timedelta(days=1)
+        except (TypeError, ValueError):
+            pass
+    return now.strftime("%Y-%m-%d"), full_time
+
+
+def convert_rmb_to_usdt(rmb, rate, fee_rate=0.0, multiply_mode=False):
+    net_rmb = rmb * (1 - fee_rate)
+    if multiply_mode:
+        return net_rmb * rate
+    if rate <= 0:
+        rate = 7.2
+    return net_rmb / rate
+
+
+def convert_usdt_to_rmb(usdt, rate, multiply_mode=False):
+    if multiply_mode:
+        return usdt / rate if rate else usdt * 7.2
+    return usdt * rate
+
+
+def parse_star_modifier(text):
+    mult = 1.0
+    fee_pct = None
+    for m in re.finditer(r"\*(\d+(?:\.\d+)?)(%?)", text):
+        val = float(m.group(1))
+        if m.group(2) == "%":
+            fee_pct = val
+        else:
+            mult *= val
+    return mult, fee_pct
+
+
+def parse_income_command(text, group_id):
+    text = normalize_billing_text(text)
+    if is_pure_arithmetic_expression(text):
+        return None
+    if text in ("+0", cmd(group_id, "bill_zero")):
+        return {"kind": "bill_zero"}
+    m = re.match(
+        r"^(?P<prefix>.*?)(?P<sign>[\+\-])(?P<num>\d+(?:\.\d+)?)"
+        r"(?P<usdt>[Uu])?"
+        r"(?P<tail>.*)$",
+        text,
+    )
+    if not m:
+        return None
+    prefix = m.group("prefix").strip()
+    sign = m.group("sign")
+    base_amount = float(m.group("num"))
+    is_usdt = bool(m.group("usdt"))
+    tail = (m.group("tail") or "").strip()
+    mult, inline_fee = parse_star_modifier(tail)
+    tail_clean = re.sub(r"\*(\d+(?:\.\d+)?%?)", "", tail).strip()
+    rate = None
+    rate_m = re.search(r"/(\d+(?:\.\d+)?)", tail_clean)
+    suffix_remark = ""
+    if rate_m:
+        rate = float(rate_m.group(1))
+        suffix_remark = tail_clean[rate_m.end():].strip()
+    else:
+        suffix_remark = tail_clean.strip()
+    remark = prefix or suffix_remark
+    amount = base_amount * mult
+    if sign == "-":
+        amount = -amount
+    return {
+        "kind": "income",
+        "remark": remark,
+        "amount": amount,
+        "is_usdt": is_usdt,
+        "rate": rate,
+        "fee_pct": inline_fee,
+    }
+
+
+def parse_expense_command(text, group_id):
+    text = normalize_billing_text(text)
+    for word in sorted(cmd_variants("expense"), key=len, reverse=True):
+        m = re.match(
+            rf"^(?P<prefix>.*?)(?:{re.escape(word)})(?P<num>\d+(?:\.\d+)?)"
+            r"(?P<usdt>[Uu])?"
+            r"(?P<tail>.*)$",
+            text,
+        )
+        if not m:
+            continue
+        prefix = m.group("prefix").strip()
+        base_amount = float(m.group("num"))
+        is_usdt = bool(m.group("usdt"))
+        tail = (m.group("tail") or "").strip()
+        mult, _ = parse_star_modifier(tail)
+        tail_clean = re.sub(r"\*(\d+(?:\.\d+)?%?)", "", tail).strip()
+        rate = None
+        rate_m = re.search(r"/(\d+(?:\.\d+)?)", tail_clean)
+        if rate_m:
+            rate = float(rate_m.group(1))
+        amount = base_amount * mult
+        return {
+            "kind": "expense",
+            "remark": prefix,
+            "amount": amount,
+            "is_usdt": is_usdt,
+            "rate": rate,
+        }
+    return None
+
+
+def match_class_start(text, group_id):
+    t = (text or "").strip()
+    extras = ("开始", "上课", "start", "Start", "START")
+    if t in extras:
+        return True
+    return t in cmd_variants("class_start")
+
+
+def match_class_end(text, group_id):
+    t = (text or "").strip()
+    extras = ("关闭", "下课", "拉停", "stop", "Stop", "STOP")
+    if t in extras:
+        return True
+    return t in cmd_variants("class_end")
+
+
+def format_rate_reply(label, rate, note=""):
+    if rate is None:
+        return f"⚠️ 暂时无法获取{label}汇率"
+    extra = f" ({note})" if note else ""
+    return f"💱 <b>{label}</b>{extra}：<code>{rate:.4f}</code>"
+
+
+def _p2p_http_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+
+
+_okx_c2c_cache = {}
+OKX_C2C_CACHE_TTL = 60
+OKX_C2C_PAYMENTS = (
+    ("bank", "银行卡"),
+    ("aliPay", "支付宝"),
+    ("wxPay", "微信"),
+)
+OKX_C2C_QUERY_COMMANDS = {
+    "la": ("buy", None),
+    "lk": ("buy", "bank"),
+    "lz": ("buy", "aliPay"),
+    "lw": ("buy", "wxPay"),
+    "lmk": ("sell", "bank"),
+    "lmz": ("sell", "aliPay"),
+    "lmw": ("sell", "wxPay"),
+}
+OKX_C2C_COMMAND_HELP = {
+    "la": "所有类型买价",
+    "lk": "银行卡买价",
+    "lz": "支付宝买价",
+    "lw": "微信买价",
+    "lmk": "银行卡卖价",
+    "lmz": "支付宝卖价",
+    "lmw": "微信卖价",
+}
+
+
+def fetch_okx_c2c_orders(payment_method, trade_side, limit=10):
+    """trade_side: buy=买价(用户买U), sell=卖价(用户卖U)。"""
+    okx_side = "sell" if trade_side == "buy" else "buy"
+    cache_key = (payment_method, okx_side, limit)
+    cached = _okx_c2c_cache.get(cache_key)
+    now = datetime.now().timestamp()
+    if cached and (now - cached[1]) < OKX_C2C_CACHE_TTL:
+        return cached[0]
+
+    try:
+        resp = requests.get(
+            "https://www.okx.com/v3/c2c/tradingOrders/books",
+            params={
+                "quoteCurrency": "CNY",
+                "baseCurrency": "USDT",
+                "side": okx_side,
+                "paymentMethod": payment_method,
+            },
+            timeout=10,
+            headers=_p2p_http_headers(),
+        )
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        if body.get("code") not in (None, 0, "0"):
+            return None
+        rows = body.get("data", {}).get(okx_side, [])[:limit]
+        orders = [
+            {
+                "price": float(row["price"]),
+                "nickName": (row.get("nickName") or "").strip() or "—",
+            }
+            for row in rows
+        ]
+        _okx_c2c_cache[cache_key] = (orders, now)
+        return orders
+    except Exception as exc:
+        log.warning("OKX C2C %s/%s fetch failed: %s", payment_method, trade_side, exc)
+    return None
+
+
+def build_query_command_footer(command_help, current_cmd):
+    """查询结果底部附其他同类命令说明（不含当前已用的命令）。"""
+    current = (current_cmd or "").strip().lower()
+    lines = []
+    for cmd, desc in command_help.items():
+        if cmd.lower() == current:
+            continue
+        lines.append(f"{cmd} {desc}")
+    if not lines:
+        return ""
+    return "\n\n命令：\n" + "\n".join(lines)
+
+
+def append_query_command_footer(body, command_help, current_cmd):
+    footer = build_query_command_footer(command_help, current_cmd)
+    return (body or "") + footer
+
+
+def format_okx_c2c_section(payment_label, trade_side, orders):
+    action = "购买" if trade_side == "buy" else "卖出"
+    prefix = "买" if trade_side == "buy" else "卖"
+    if not orders:
+        return f"⚠️ 暂时无法获取欧易-{payment_label}USDT{action}价"
+    lines = [f"当前设置欧易-{payment_label}USDT{action}价"]
+    for idx, row in enumerate(orders, 1):
+        lines.append(f"{prefix}{idx}：{row['price']:.2f}   {row['nickName']}")
+    return "\n".join(lines)
+
+
+def build_okx_c2c_reply(command):
+    cmd = (command or "").lower()
+    spec = OKX_C2C_QUERY_COMMANDS.get(cmd)
+    if not spec:
+        return None
+    trade_side, payment = spec
+    if payment is None:
+        sections = []
+        for pm_key, pm_label in OKX_C2C_PAYMENTS:
+            orders = fetch_okx_c2c_orders(pm_key, trade_side)
+            sections.append(format_okx_c2c_section(pm_label, trade_side, orders))
+        body = "\n\n".join(sections)
+    else:
+        pm_label = dict(OKX_C2C_PAYMENTS).get(payment, payment)
+        orders = fetch_okx_c2c_orders(payment, trade_side)
+        body = format_okx_c2c_section(pm_label, trade_side, orders)
+    return append_query_command_footer(body, OKX_C2C_COMMAND_HELP, cmd)
+
+
+def fetch_binance_p2p_rate(fiat, trade_type="SELL", pay_types=None):
+    """Binance C2C 报价；SELL=用户买 USDT。"""
+    orders = fetch_binance_p2p_orders(fiat, pay_types or [], trade_type, limit=1)
+    if orders:
+        return orders[0]["price"]
+    return None
+
+
+_binance_p2p_cache = {}
+BINANCE_P2P_CACHE_TTL = 60
+BYBIT_OTC_URL = "https://api2.bybit.com/fiat/otc/item/online"
+_mmk_p2p_cache = {}
+MMK_P2P_CACHE_TTL = 60
+# Bybit MMK 支付方式 ID（side=1 表示商家卖 USDT，用户用缅币买 U）
+BYBIT_MMK_PAYMENTS = (
+    (["601"], "KBZPay"),
+    (["602", "605"], "Mobile Banking"),
+)
+MMK_QUERY_COMMANDS = {
+    "bma": None,
+    "bkb": "KBZPay",
+    "bmm": "Mobile Banking",
+}
+MMK_COMMAND_HELP = {
+    "mm0": "缅币 OTC 快查",
+    "bma": "KBZ + Mobile Banking Top10",
+    "bkb": "KBZPay Top10",
+    "bmm": "Mobile Banking Top10",
+}
+OTC_COMMAND_HELP = {
+    "Z0": "欧易 OTC 汇率",
+    "H0": "火币 OTC 汇率",
+    "m0": "马币 OTC 汇率",
+    "mm0": "缅币 P2P 快查",
+}
+MMK_QUERY_PAYMENT_IDS = {
+    "KBZPay": ["601"],
+    "Mobile Banking": ["602", "605"],
+}
+
+
+def _binance_p2p_headers(fiat="MMK"):
+    headers = {
+        **_p2p_http_headers(),
+        "Content-Type": "application/json",
+        "clienttype": "web",
+        "lang": "en",
+    }
+    if fiat == "MMK":
+        headers["bnc-location"] = "MM"
+    return headers
+
+
+def fetch_binance_p2p_orders(fiat, pay_types, trade_type="SELL", limit=10):
+    pay_types = list(pay_types or [])
+    cache_key = (fiat, tuple(pay_types), trade_type, limit)
+    cached = _binance_p2p_cache.get(cache_key)
+    now = datetime.now().timestamp()
+    if cached and (now - cached[1]) < BINANCE_P2P_CACHE_TTL:
+        return cached[0]
+
+    payload = {
+        "asset": "USDT",
+        "fiat": fiat,
+        "merchantCheck": False,
+        "page": 1,
+        "payTypes": pay_types,
+        "publisherType": None,
+        "rows": limit,
+        "tradeType": trade_type,
+        "countries": [],
+        "proMerchantAds": False,
+        "shieldMerchantAds": False,
+        "filterType": "all",
+        "periods": [],
+        "additionalKycVerifyFilter": 0,
+        "classifies": ["mass", "profession", "fiat_trade"],
+    }
+    try:
+        resp = requests.post(
+            "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+            json=payload,
+            timeout=12,
+            headers=_binance_p2p_headers(fiat),
+        )
+        if resp.status_code != 200:
+            return None
+        rows = resp.json().get("data") or []
+        orders = []
+        for item in rows[:limit]:
+            adv = item.get("adv") or {}
+            advertiser = item.get("advertiser") or {}
+            price = adv.get("price")
+            if price is None:
+                continue
+            orders.append({
+                "price": float(price),
+                "nickName": (advertiser.get("nickName") or "").strip() or "—",
+            })
+        _binance_p2p_cache[cache_key] = (orders, now)
+        return orders
+    except Exception as exc:
+        log.warning("Binance P2P orders %s/%s failed: %s", fiat, pay_types, exc)
+    return None
+
+
+def _bybit_p2p_headers():
+    return {
+        **_p2p_http_headers(),
+        "Content-Type": "application/json",
+        "lang": "en-US",
+        "platform": "PC",
+    }
+
+
+def fetch_bybit_p2p_orders(currency, payment_ids, side="1", limit=10):
+    """Bybit OTC；side=1 商家卖 USDT（用户买 U）。"""
+    payment_ids = [str(x) for x in (payment_ids or [])]
+    cache_key = ("bybit", currency, tuple(payment_ids), side, limit)
+    cached = _mmk_p2p_cache.get(cache_key)
+    now = datetime.now().timestamp()
+    if cached and (now - cached[1]) < MMK_P2P_CACHE_TTL:
+        return cached[0]
+
+    payload = {
+        "tokenId": "USDT",
+        "currencyId": currency,
+        "side": str(side),
+        "size": str(limit),
+        "page": "1",
+        "amount": "",
+        "payment": payment_ids,
+    }
+    try:
+        resp = requests.post(
+            BYBIT_OTC_URL,
+            json=payload,
+            timeout=12,
+            headers=_bybit_p2p_headers(),
+        )
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        if body.get("ret_code") not in (0, "0", None):
+            log.warning("Bybit OTC %s failed: %s", payment_ids, body.get("ret_msg"))
+            return None
+        items = (body.get("result") or {}).get("items") or []
+        orders = []
+        for item in items[:limit]:
+            if item.get("price") is None:
+                continue
+            orders.append({
+                "price": float(item["price"]),
+                "nickName": (item.get("nickName") or "").strip() or "—",
+                "minAmount": item.get("minAmount"),
+                "maxAmount": item.get("maxAmount"),
+                "lastQuantity": item.get("lastQuantity"),
+            })
+        _mmk_p2p_cache[cache_key] = (orders, now)
+        return orders
+    except Exception as exc:
+        log.warning("Bybit P2P orders %s failed: %s", payment_ids, exc)
+    return None
+
+
+def fetch_mmk_p2p_orders(payment_ids, limit=10):
+    """缅币 P2P：优先 Bybit，备用 Binance。"""
+    orders = fetch_bybit_p2p_orders("MMK", payment_ids, "1", limit)
+    if orders is not None:
+        return orders, "Bybit"
+    binance_map = {
+        "601": "KBZPay1",
+        "602": "WavePay1",
+        "605": "WaveMobile",
+    }
+    if payment_ids and len(payment_ids) == 1:
+        binance_pay = [binance_map.get(payment_ids[0], payment_ids[0])]
+    elif payment_ids:
+        binance_pay = [binance_map.get(p, p) for p in payment_ids]
+    else:
+        binance_pay = []
+    orders = fetch_binance_p2p_orders("MMK", binance_pay, "SELL", limit)
+    if orders is not None:
+        return orders, "Binance"
+    return None, "Bybit"
+
+
+def _format_mmk_limit(min_amount, max_amount):
+    try:
+        min_val = float(min_amount)
+        max_val = float(max_amount)
+        return f"限额 {min_val:,.0f}-{max_val:,.0f} MMK"
+    except (TypeError, ValueError):
+        return ""
+
+
+def format_mmk_p2p_section(payment_label, orders, source="Bybit"):
+    if orders is None:
+        return (
+            f"⚠️ 暂时无法连接 {source}-{payment_label} P2P\n"
+            "请稍后重试，或在 Bybit App → P2P → MMK 查看。"
+        )
+    if not orders:
+        return (
+            f"⚠️ {source}-{payment_label} 当前 P2P 无挂单\n"
+            "请稍后再试，或在 Bybit App 的 P2P 缅甸区核对。"
+        )
+    lines = [f"当前设置{source}-{payment_label} USDT购买价"]
+    for idx, row in enumerate(orders, 1):
+        limit_text = _format_mmk_limit(row.get("minAmount"), row.get("maxAmount"))
+        if limit_text:
+            lines.append(f"买{idx}：{row['price']:.2f}   {row['nickName']}   {limit_text}")
+        else:
+            lines.append(f"买{idx}：{row['price']:.2f}   {row['nickName']}")
+    return "\n".join(lines)
+
+
+def build_mmk_p2p_reply(command):
+    cmd = (command or "").lower()
+    pay_label = MMK_QUERY_COMMANDS.get(cmd)
+    if pay_label is None and cmd != "bma":
+        return None
+    if cmd == "bma":
+        sections = []
+        for payment_ids, label in BYBIT_MMK_PAYMENTS:
+            orders, source = fetch_mmk_p2p_orders(payment_ids, 10)
+            sections.append(format_mmk_p2p_section(label, orders, source))
+        body = "\n\n".join(sections)
+    else:
+        payment_ids = MMK_QUERY_PAYMENT_IDS.get(pay_label, [])
+        orders, source = fetch_mmk_p2p_orders(payment_ids, 10)
+        body = format_mmk_p2p_section(pay_label, orders, source)
+    return append_query_command_footer(body, MMK_COMMAND_HELP, cmd)
+
+
+def fetch_coingecko_usdt_rate(vs_currency):
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "tether", "vs_currencies": vs_currency.lower()},
+            timeout=10,
+            headers=_p2p_http_headers(),
+        )
+        if resp.status_code == 200:
+            val = resp.json().get("tether", {}).get(vs_currency.lower())
+            if val is not None:
+                return float(val)
+    except Exception as exc:
+        log.warning("CoinGecko %s fetch failed: %s", vs_currency, exc)
+    return None
+
+
+def fetch_okx_usdt_cny_rate():
+    headers = _p2p_http_headers()
+    try:
+        resp = requests.get(
+            "https://www.okx.com/v3/c2c/tradingOrders/books",
+            params={
+                "quoteCurrency": "CNY",
+                "baseCurrency": "USDT",
+                "side": "sell",
+                "paymentMethod": "all",
+            },
+            timeout=10,
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            if body.get("code") in (None, 0, "0"):
+                sell = body.get("data", {}).get("sell", [])
+                if sell:
+                    return float(sell[0]["price"])
+    except Exception as exc:
+        log.warning("OKX rate fetch failed: %s", exc)
+    return fetch_binance_p2p_rate("CNY", "SELL")
+
+
+def fetch_huobi_usdt_cny_rate():
+    headers = {**_p2p_http_headers(), "Referer": "https://www.htx.com/"}
+    sources = (
+        ("https://otc-api.huobi.pro/v1/data/trade-market", {
+            "coinId": 2, "currency": 1, "tradeType": "sell", "currPage": 1, "payMethod": 0,
+        }),
+        ("https://www.htx.com/-/x/otc/v1/data/trade-market", {
+            "coinId": 2, "currency": 1, "tradeType": "sell", "currPage": 1, "payMethod": 0,
+        }),
+    )
+    for url, params in sources:
+        try:
+            resp = requests.get(url, params=params, timeout=10, headers=headers)
+            if resp.status_code != 200:
+                continue
+            payload = resp.json()
+            rows = payload.get("data")
+            if isinstance(rows, list) and rows:
+                price = rows[0].get("price")
+                if price is not None:
+                    return float(price)
+        except Exception as exc:
+            log.warning("Huobi/HTX rate fetch failed (%s): %s", url, exc)
+    rate = fetch_binance_p2p_rate("CNY", "SELL")
+    if rate is not None:
+        return rate
+    return fetch_okx_usdt_cny_rate()
+
+
+def fetch_myr_usdt_rate():
+    rate = fetch_binance_p2p_rate("MYR", "SELL")
+    if rate is not None:
+        return rate
+    rate = fetch_coingecko_usdt_rate("myr")
+    if rate is not None:
+        return rate
+    return None
+
+
+def fetch_myr_usdt_rate_with_note():
+    rate = fetch_binance_p2p_rate("MYR", "SELL")
+    if rate is not None:
+        return rate, ""
+    rate = fetch_coingecko_usdt_rate("myr")
+    if rate is not None:
+        return rate, "现货参考"
+    return None, ""
+
+
+def fetch_mmk_usdt_rate_with_note():
+    """缅币 MMK/USDT：优先 Bybit P2P（KBZPay → Mobile Banking → 全渠道）。"""
+    for payment_ids, label in (
+        (["601"], "KBZPay"),
+        (["602", "605"], "Mobile Banking"),
+        ([], "Bybit P2P"),
+    ):
+        orders, source = fetch_mmk_p2p_orders(payment_ids, 1)
+        if orders:
+            note = label if source == "Bybit" else f"{source} {label}"
+            return orders[0]["price"], note
+    return None, ""
+
+
+def delete_bills_by_source_message(group_id, source_message_id, bill_type=None, limit=None):
+    conn = get_db()
+    c = conn.cursor()
+    if bill_type:
+        sql = (
+            "SELECT id FROM bills WHERE group_id = ? AND source_message_id = ? AND bill_type = ? "
+            "ORDER BY id DESC"
+        )
+        params = (group_id, source_message_id, bill_type)
+    else:
+        sql = "SELECT id FROM bills WHERE group_id = ? AND source_message_id = ? ORDER BY id DESC"
+        params = (group_id, source_message_id)
+    c.execute(sql, params)
+    ids = [row[0] for row in c.fetchall()]
+    if limit:
+        ids = ids[:limit]
+    for bid in ids:
+        c.execute("DELETE FROM bills WHERE id = ?", (bid,))
+    deleted = len(ids)
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def delete_recent_bills(group_id, bill_type, count, target_date=None):
+    conn = get_db()
+    c = conn.cursor()
+    if target_date:
+        c.execute(
+            "SELECT id FROM bills WHERE group_id = ? AND bill_type = ? AND date_str = ? ORDER BY id DESC LIMIT ?",
+            (group_id, bill_type, target_date, count),
+        )
+    else:
+        c.execute(
+            "SELECT id FROM bills WHERE group_id = ? AND bill_type = ? ORDER BY id DESC LIMIT ?",
+            (group_id, bill_type, count),
+        )
+    ids = [row[0] for row in c.fetchall()]
+    for bid in ids:
+        c.execute("DELETE FROM bills WHERE id = ?", (bid,))
+    conn.commit()
+    conn.close()
+    return len(ids)
+
+
+def update_bills_exchange_rate(group_id, new_rate, target_date=None):
+    conn = get_db()
+    c = conn.cursor()
+    if target_date:
+        c.execute(
+            "UPDATE bills SET exchange_rate = ?, usdt_amount = amount / ? "
+            "WHERE group_id = ? AND date_str = ? AND bill_type = 'income' AND amount != 0",
+            (new_rate, new_rate, group_id, target_date),
+        )
+    else:
+        c.execute(
+            "UPDATE bills SET exchange_rate = ?, usdt_amount = amount / ? "
+            "WHERE group_id = ? AND bill_type = 'income' AND amount != 0",
+            (new_rate, new_rate, group_id),
+        )
+    updated = c.rowcount
+    conn.commit()
+    conn.close()
+    update_setting(group_id, "exchange_rate", new_rate)
+    return updated
+
+
+def get_user_bills_today(group_id, user_id, target_date):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT bill_type, remark, amount, usdt_amount, timestamp FROM bills "
+        "WHERE group_id = ? AND date_str = ? AND user_id = ? ORDER BY id ASC",
+        (group_id, target_date, user_id),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def build_self_bill_report(group_id, user_id, target_date, display_name):
+    rows = get_user_bills_today(group_id, user_id, target_date)
+    if not rows:
+        return f"📭 <b>{_html_esc(display_name)}</b> 今日暂无个人账单。"
+    income_lines, expense_lines = [], []
+    total_in, total_out = 0.0, 0.0
+    for bill_type, remark, amount, usdt, ts in rows:
+        time_s = ts[11:19] if len(ts) > 16 else ts[11:16]
+        rem = _html_esc(remark or tr(group_id, "no_remark"))
+        if bill_type == "income":
+            income_lines.append(f"{time_s} {rem} {_tag_rmb(amount)} / {usdt:.2f}U")
+            total_in += usdt or 0
+        else:
+            expense_lines.append(f"{time_s} {rem} {usdt:.2f}U")
+            total_out += usdt or 0
+    parts = [f"👤 <b>{_html_esc(display_name)}</b> 今日自查 ({target_date})"]
+    if income_lines:
+        parts.append("\n<b>入款</b>\n" + "\n".join(income_lines))
+        parts.append(f"入款合计：<b>{total_in:.2f}U</b>")
+    if expense_lines:
+        parts.append("\n<b>下发</b>\n" + "\n".join(expense_lines))
+        parts.append(f"下发合计：<b>{total_out:.2f}U</b>")
+    return "\n".join(parts)
+
+
+def process_extended_settings(message, text, gid, uid, tg_username, today):
+    """处理扩展设置/查询命令，返回 True 表示已处理。"""
+    t = (text or "").strip()
+
+    if t in ("汇率", "查汇率"):
+        rate = get_effective_rate(gid, "income")
+        bot.reply_to(message, f"💱 当前入款汇率：<code>{rate:.4f}</code>", parse_mode="HTML")
+        return True
+    if t in ("下发汇率", "查下发汇率"):
+        rate = get_effective_rate(gid, "expense")
+        mode = get_extra_settings(gid).get("expense_mode") or "usdt"
+        mode_label = "人民币下发" if mode == "rmb" else "U 下发"
+        bot.reply_to(
+            message,
+            f"💱 当前下发汇率：<code>{rate:.4f}</code>（{mode_label}）\n"
+            f"例：<code>下发500</code> → "
+            f"{'500÷' + f'{rate:.2f}' + '=' + f'{500/rate:.2f}' if mode == 'rmb' else '500U'}",
+            parse_mode="HTML",
+        )
+        return True
+    if t.upper() == "Z0":
+        body = format_rate_reply("欧易 OTC", fetch_okx_usdt_cny_rate())
+        bot.reply_to(
+            message,
+            append_query_command_footer(body, OTC_COMMAND_HELP, "Z0"),
+            parse_mode="HTML",
+        )
+        return True
+    if t.upper() == "H0":
+        body = format_rate_reply("火币 OTC", fetch_huobi_usdt_cny_rate())
+        bot.reply_to(
+            message,
+            append_query_command_footer(body, OTC_COMMAND_HELP, "H0"),
+            parse_mode="HTML",
+        )
+        return True
+    if t.lower() == "m0":
+        rate, note = fetch_myr_usdt_rate_with_note()
+        body = format_rate_reply("马币 OTC", rate, note)
+        bot.reply_to(
+            message,
+            append_query_command_footer(body, OTC_COMMAND_HELP, "m0"),
+            parse_mode="HTML",
+        )
+        return True
+    if t.lower() == "mm0":
+        rate, note = fetch_mmk_usdt_rate_with_note()
+        if rate is None:
+            body = (
+                "⚠️ <b>Bybit MMK P2P 当前无 USDT 卖单</b>\n\n"
+                "请试分渠道命令：\n"
+                "• <code>bkb</code> — KBZPay Top10\n"
+                "• <code>bmm</code> — Mobile Banking Top10\n"
+                "• <code>bma</code> — 以上两种各 Top10"
+            )
+        else:
+            body = format_rate_reply("Bybit MMK P2P", rate, note)
+        bot.reply_to(
+            message,
+            append_query_command_footer(body, MMK_COMMAND_HELP, "mm0"),
+            parse_mode="HTML",
+        )
+        return True
+
+    if t.lower() in MMK_QUERY_COMMANDS:
+        try:
+            bot.reply_to(message, build_mmk_p2p_reply(t))
+        except Exception as exc:
+            log.exception("MMK P2P query failed: %s", exc)
+            bot.reply_to(message, f"⚠️ MMK 汇率查询失败，请稍后重试。（{exc}）")
+        return True
+
+    if t.lower() in OKX_C2C_QUERY_COMMANDS:
+        bot.reply_to(message, build_okx_c2c_reply(t))
+        return True
+
+    m = re.match(r"^查汇率(\d+(?:\.\d+)?)$", t)
+    if m:
+        cny = float(m.group(1))
+        rate = get_effective_rate(gid, "income")
+        usdt = convert_rmb_to_usdt(
+            cny, rate, get_effective_fee(gid, "income"),
+            get_extra_settings(gid).get("multiply_rate_mode"),
+        )
+        bot.reply_to(
+            message,
+            f"💱 {cny:.2f} CNY ≈ <code>{usdt:.4f}</code> U（汇率 {rate:.4f}）",
+            parse_mode="HTML",
+        )
+        return True
+
+    m = re.match(r"^币价(\d+(?:\.\d+)?)\s+汇率(\d+(?:\.\d+)?)$", t)
+    if m:
+        price = float(m.group(1))
+        rate = float(m.group(2))
+        result = price / rate if rate else 0
+        bot.reply_to(message, f"🧮 点位计算：{price} / {rate} = <code>{result:.4f}</code> U", parse_mode="HTML")
+        return True
+
+    if process_lookup_queries(message, t):
+        return True
+
+    setting_patterns = [
+        (r"^设置入款费率\s*(-?\d+(?:\.\d+)?)$", "income_fee_rate", lambda v: float(v) / 100),
+        (r"^设置下发费率\s*(-?\d+(?:\.\d+)?)$", "expense_fee_rate", lambda v: float(v) / 100),
+        (r"^设置入款汇率\s*(-?\d+(?:\.\d+)?)$", "income_exchange_rate", float),
+        (r"^设置下发汇率\s*(-?\d+(?:\.\d+)?)$", "expense_exchange_rate", float),
+        (r"^设置代付价格(\d+(?:\.\d+)?)$", "payment_price", float),
+        (r"^设置币种([A-Za-z]{3})$", "currency", lambda v: v.upper()),
+        (r"^显示条数(\d+)$", "display_count", int),
+        (r"^设置日切(\d{1,2})$", "day_cut_hour", int),
+        (r"^设置全局日切(\d{1,2})$", "global_day_cut_hour", int),
+        (r"^催收(\d+)$", "collection_interval", int),
+    ]
+    for pattern, key, conv in setting_patterns:
+        m = re.match(pattern, t)
+        if m:
+            if not can_operate_in_group(gid, uid, tg_username):
+                bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
+                return True
+            val = conv(m.group(1))
+            if key == "collection_interval":
+                update_extra_setting(gid, "collection_enabled", True)
+            if key == "expense_exchange_rate":
+                apply_expense_exchange_rate(gid, val)
+                saved = get_effective_rate(gid, "expense")
+                bot.reply_to(
+                    message,
+                    f"✅ 已设置下发汇率 <code>{saved:.4f}</code>，并切换为<b>人民币下发模式</b>\n"
+                    f"（例：<code>下发500</code> = 500 ÷ {saved} = <code>{500 / saved:.2f}</code>U）\n"
+                    f"💡 发送 <code>下发汇率</code> 可随时查看当前下发汇率",
+                    parse_mode="HTML",
+                )
+                return True
+            update_extra_setting(gid, key, val)
+            bot.reply_to(message, f"✅ 已设置 <b>{key}</b> = <code>{val}</code>", parse_mode="HTML")
+            return True
+
+    simple_toggles = {
+        "设置实时汇率": ("use_realtime_rate", True),
+        "开启乘汇率模式": ("multiply_rate_mode", True),
+        "关闭乘汇率模式": ("multiply_rate_mode", False),
+        "显示人民币": ("show_rmb", True),
+        "隐藏人民币": ("show_rmb", False),
+        "显示分秒": ("time_format", "hm"),
+        "显示时分秒": ("time_format", "hms"),
+        "开启记账置顶": ("pin_bills", True),
+        "关闭记账置顶": ("pin_bills", False),
+        "关闭日切": ("day_cut_hour", None),
+        "关闭全局日切": ("global_day_cut_hour", None),
+        "开启地址识别": ("address_detect", True),
+        "关闭地址识别": ("address_detect", False),
+        "开启银行卡自动识别": ("bank_detect", True),
+        "关闭银行卡识别": ("bank_detect", False),
+        "开启用户变更通知": ("user_change_notify", True),
+        "关闭用户变更通知": ("user_change_notify", False),
+        "开启操作人分类": ("classify_mode", "operator"),
+        "开启回复人分类": ("classify_mode", "replier"),
+        "关闭分类": ("classify_mode", "none"),
+        "开启催收": ("collection_enabled", True),
+        "关闭催收": ("collection_enabled", False),
+        "设置下发人民币模式": ("expense_mode", "rmb"),
+        "设置下发币模式": ("expense_mode", "usdt"),
+        "设置所有人": ("all_operators", True),
+        "取消所有人": ("all_operators", False),
+    }
+    if t in simple_toggles:
+        if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
+            return True
+        key, val = simple_toggles[t]
+        update_extra_setting(gid, key, val)
+        bot.reply_to(message, f"✅ 已更新：<b>{t}</b>", parse_mode="HTML")
+        return True
+
+    m = re.match(r"^设置实时汇率(-?\d+(?:\.\d+)?)$", t)
+    if m:
+        if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
+            return True
+        update_extra_setting(gid, "use_realtime_rate", True)
+        update_extra_setting(gid, "realtime_rate_offset", float(m.group(1)))
+        bot.reply_to(message, f"✅ 已开启实时汇率，偏移 <code>{m.group(1)}</code>", parse_mode="HTML")
+        return True
+
+    m = re.match(r"^设置下发地址(.+)$", t)
+    if m:
+        if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
+            return True
+        addr = m.group(1).strip()
+        extra = get_extra_settings(gid)
+        addrs = list(extra.get("payout_addresses") or [])
+        if addr not in addrs:
+            addrs.append(addr)
+        update_extra_setting(gid, "payout_addresses", addrs)
+        bot.reply_to(message, f"✅ 已添加下发地址：<code>{_html_esc(addr)}</code>", parse_mode="HTML")
+        return True
+
+    m = re.match(r"^删除下发地址(.+)$", t)
+    if m:
+        if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
+            return True
+        addr = m.group(1).strip()
+        extra = get_extra_settings(gid)
+        addrs = [a for a in (extra.get("payout_addresses") or []) if a != addr]
+        update_extra_setting(gid, "payout_addresses", addrs)
+        bot.reply_to(message, "✅ 已删除下发地址。", parse_mode="HTML")
+        return True
+
+    if t == "删除账单":
+        if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_delete_perm"), parse_mode="HTML")
+            return True
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("DELETE FROM bills WHERE group_id = ? AND date_str = ?", (gid, today))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, tr(gid, "delete_today_ok", date=today))
+        send_text_bill_report(gid, gid, today)
+        return True
+
+    m = re.match(r"^修改汇款(-?\d+(?:\.\d+)?)$", t)
+    if m:
+        if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
+            return True
+        new_rate = float(m.group(1))
+        updated = update_bills_exchange_rate(gid, new_rate, today)
+        bot.reply_to(
+            message,
+            f"✅ 已同步更新今日 {updated} 笔入款汇率为 <code>{new_rate:.4f}</code>",
+            parse_mode="HTML",
+        )
+        send_text_bill_report(gid, gid, today)
+        return True
+
+    if t == "通知所有人":
+        if not can_manage_group_operators(uid):
+            bot.reply_to(message, tr(gid, "no_manage_operators"), parse_mode="HTML")
+            return True
+        try:
+            bot.send_message(gid, "📢 请各位操作人注意查账。")
+        except Exception as exc:
+            bot.reply_to(message, f"❌ 通知失败：{exc}")
+            return True
+        bot.reply_to(message, "✅ 已发送群通知。")
+        return True
+
+    if t in ("置顶", "取消置顶"):
+        if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
+            return True
+        if t == "置顶" and message.reply_to_message:
+            try:
+                bot.pin_chat_message(gid, message.reply_to_message.message_id, disable_notification=True)
+                bot.reply_to(message, "📌 已置顶。")
+            except Exception as exc:
+                bot.reply_to(message, f"❌ 置顶失败：{exc}")
+        elif t == "取消置顶" and message.reply_to_message:
+            try:
+                bot.unpin_chat_message(gid, message.reply_to_message.message_id)
+                bot.reply_to(message, "📌 已取消置顶。")
+            except Exception as exc:
+                bot.reply_to(message, f"❌ 取消置顶失败：{exc}")
+        else:
+            bot.reply_to(message, "💡 请回复要置顶/取消置顶的消息。")
+        return True
+
+    return False
+
+
+def _luhn_valid(card_no):
+    digits = [int(c) for c in card_no if c.isdigit()]
+    if len(digits) < 13:
+        return False
+    checksum = 0
+    parity = len(digits) % 2
+    for idx, digit in enumerate(digits):
+        if idx % 2 == parity:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        checksum += digit
+    return checksum % 10 == 0
+
+
+def _id_card_checksum_valid(id_num):
+    weights = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+    check_map = "10X98765432"
+    body, check = id_num[:17], id_num[17].upper()
+    if not body.isdigit():
+        return False
+    total = sum(int(body[i]) * weights[i] for i in range(17))
+    return check_map[total % 11] == check
+
+
+def _id_card_region(code6):
+    if code6 in ID_AREA_MAP:
+        return ID_AREA_MAP[code6]
+    prov = ID_PROVINCE_MAP.get(code6[:2])
+    if prov:
+        return f"{prov}（{code6}）"
+    return f"未知地区（{code6}）"
+
+
+def parse_id_card_info(id_num):
+    id_num = id_num.upper()
+    if not re.fullmatch(r"\d{17}[\dX]", id_num):
+        return None
+    valid = _id_card_checksum_valid(id_num)
+    region = _id_card_region(id_num[:6])
+    birth_raw = id_num[6:14]
+    try:
+        birth = datetime.strptime(birth_raw, "%Y%m%d").date()
+        age = (datetime.now().date() - birth).days // 365
+        birth_text = birth.strftime("%Y-%m-%d")
+    except ValueError:
+        birth_text = f"{birth_raw[:4]}-{birth_raw[4:6]}-{birth_raw[6:8]}"
+        age = None
+    gender = "男" if int(id_num[16]) % 2 else "女"
+    return {
+        "number": id_num,
+        "valid": valid,
+        "region": region,
+        "birthday": birth_text,
+        "age": age,
+        "gender": gender,
+    }
+
+
+def _phone_carrier(phone):
+    prefix3 = phone[:3]
+    for prefixes, carrier in PHONE_CARRIER_PREFIXES:
+        if prefix3 in prefixes:
+            return carrier
+    return "未知运营商"
+
+
+def _fetch_phone_from_sogou(phone):
+    """搜狗号段库备用（前 7 位）。"""
+    if len(phone) < 7:
+        return None
+    try:
+        resp = requests.get(
+            "https://www.sogou.com/websearch/phoneAddress.jsp",
+            params={"phoneNumber": phone[:7]},
+            timeout=8,
+            headers=_p2p_http_headers(),
+        )
+        if resp.status_code != 200:
+            return None
+        match = re.search(r'void\("(.+?)"\)', resp.text)
+        if not match:
+            return None
+        tokens = match.group(1).strip().split()
+        if not tokens:
+            return None
+        carrier = ""
+        loc_tokens = tokens
+        if any(k in tokens[-1] for k in ("移动", "联通", "电信", "广电")):
+            carrier = tokens[-1]
+            loc_tokens = tokens[:-1]
+        location = "".join(loc_tokens)
+        if not location and not carrier:
+            return None
+        return {
+            "province": location,
+            "city": "",
+            "carrier": carrier,
+            "source": "搜狗号段库",
+        }
+    except Exception as exc:
+        log.warning("sogou phone lookup failed: %s", exc)
+    return None
+
+
+def fetch_phone_info(phone):
+    info = {"number": phone, "carrier": _phone_carrier(phone), "province": "", "city": "", "source": "号段识别"}
+    urls = []
+    if PHONE_LOOKUP_URL:
+        urls.append(PHONE_LOOKUP_URL.replace("{phone}", phone))
+    urls.append(f"https://api.vvhan.com/api/phone?tel={phone}")
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=8, headers=_p2p_http_headers())
+            if resp.status_code != 200:
+                continue
+            payload = resp.json()
+            if payload.get("success") is False:
+                continue
+            block = payload.get("info") or payload.get("data") or payload
+            province = block.get("province") or block.get("prov") or ""
+            city = block.get("city") or block.get("area") or ""
+            carrier = block.get("carrier") or block.get("operator") or block.get("sp") or ""
+            if province or city or carrier:
+                info["province"] = str(province).strip()
+                info["city"] = str(city).strip()
+                if carrier:
+                    info["carrier"] = str(carrier).strip()
+                info["source"] = "在线号段库"
+                return info
+        except Exception as exc:
+            log.warning("phone lookup failed (%s): %s", url, exc)
+
+    sogou = _fetch_phone_from_sogou(phone)
+    if sogou:
+        info["province"] = sogou.get("province") or ""
+        info["city"] = sogou.get("city") or ""
+        if sogou.get("carrier"):
+            info["carrier"] = sogou["carrier"]
+        info["source"] = sogou.get("source") or "搜狗号段库"
+    return info
+
+
+def _bank_from_local_bin(card_no):
+    for prefix, bank, card_type in sorted(BANK_BIN_MAP, key=lambda x: len(x[0]), reverse=True):
+        if card_no.startswith(prefix):
+            return {"bank": bank, "card_type": card_type, "validated": None, "source": "本地BIN库"}
+    return None
+
+
+def fetch_bank_card_info(card_no):
+    info = _bank_from_local_bin(card_no) or {
+        "bank": "", "card_type": "", "validated": None, "source": "",
+    }
+    info["number"] = card_no
+    info["luhn"] = _luhn_valid(card_no)
+    try:
+        resp = requests.get(
+            "https://ccdcapi.alipay.com/validateAndCacheCardInfo.json",
+            params={"cardNo": card_no, "cardBinCheck": "true"},
+            timeout=8,
+            headers=_p2p_http_headers(),
+        )
+        if resp.status_code == 200:
+            payload = resp.json()
+            if payload.get("validated"):
+                bank_code = payload.get("bank") or ""
+                card_type_code = payload.get("cardType") or ""
+                info["bank"] = BANK_CODE_NAMES.get(bank_code, bank_code or info.get("bank", ""))
+                info["card_type"] = CARD_TYPE_NAMES.get(card_type_code, card_type_code or info.get("card_type", ""))
+                info["validated"] = True
+                info["source"] = "支付宝BIN"
+            elif not info.get("bank"):
+                info["validated"] = False
+    except Exception as exc:
+        log.warning("bank card lookup failed: %s", exc)
+    if not info.get("bank") and info.get("luhn"):
+        info["source"] = info.get("source") or "格式校验"
+    return info
+
+
+def format_phone_lookup_reply(info):
+    lines = [
+        "📱 <b>手机号查询</b>",
+        f"号码：<code>{info['number']}</code>",
+        f"运营商：{info['carrier']}",
+    ]
+    loc_parts = [x for x in (info.get("province"), info.get("city")) if x]
+    if loc_parts:
+        lines.append(f"归属地：{''.join(loc_parts)}")
+    else:
+        lines.append("归属地：暂未识别（在线号段库连接失败）")
+    lines.append(f"来源：{info.get('source', '号段识别')}")
+    lines.append("说明：不含机主姓名等隐私信息。")
+    return "\n".join(lines)
+
+
+def format_bank_lookup_reply(info):
+    lines = [
+        "💳 <b>银行卡查询</b>",
+        f"卡号：<code>{info['number']}</code>",
+    ]
+    if info.get("bank"):
+        lines.append(f"发卡行：{info['bank']}")
+    else:
+        lines.append("发卡行：未识别（请确认卡号前 6 位是否正确）")
+    if info.get("card_type"):
+        lines.append(f"卡类型：{info['card_type']}")
+    if info.get("validated") is True:
+        lines.append("BIN校验：通过")
+    elif info.get("validated") is False:
+        lines.append("BIN校验：未通过（可能是测试号或卡号有误）")
+    if info.get("luhn") is not None:
+        lines.append(f"Luhn校验：{'通过' if info['luhn'] else '未通过'}")
+    if info.get("source"):
+        lines.append(f"来源：{info['source']}")
+    lines.append("说明：不含持卡人姓名/余额；仅识别发卡行与卡类型。")
+    return "\n".join(lines)
+
+
+def format_id_lookup_reply(info):
+    lines = [
+        "🪪 <b>身份证解析</b>",
+        f"号码：<code>{info['number']}</code>",
+        f"归属地：{info['region']}",
+        f"出生日期：{info['birthday']}",
+    ]
+    if info.get("age") is not None:
+        lines.append(f"年龄：约 {info['age']} 岁")
+    lines.append(f"性别：{info['gender']}")
+    lines.append(f"校验码：{'有效' if info['valid'] else '无效（号码可能有误）'}")
+    lines.append("说明：由号码规则解析，不含姓名等实名信息。")
+    return "\n".join(lines)
+
+
+def _reply_lookup(message, text):
+    wait = bot.reply_to(message, "🔍 正在查询资料…")
+    try:
+        reply = text
+        if isinstance(text, str):
+            bot.reply_to(message, reply, parse_mode="HTML")
+        else:
+            bot.reply_to(message, reply)
+    finally:
+        try:
+            bot.delete_message(message.chat.id, wait.message_id)
+        except Exception:
+            pass
+
+
+def process_lookup_queries(message, text):
+    """手机号 / 银行卡 / 身份证查询（群/私聊均可）。"""
+    t = (text or "").strip()
+    gid = message.chat.id
+
+    m = re.match(r"^查询(\d{11})$", t)
+    if m and m.group(1).startswith("1"):
+        phone = m.group(1)
+        info = fetch_phone_info(phone)
+        _reply_lookup(message, format_phone_lookup_reply(info))
+        return True
+
+    m = re.match(r"^查询(\d{17}[\dXx])$", t)
+    if m:
+        id_num = m.group(1).upper()
+        info = parse_id_card_info(id_num)
+        if info:
+            _reply_lookup(message, format_id_lookup_reply(info))
+        else:
+            bot.reply_to(message, "❌ 身份证号码格式不正确。", parse_mode="HTML")
+        return True
+
+    m = re.match(r"^查询(\d{16,19})$", t)
+    if m:
+        card = m.group(1)
+        info = fetch_bank_card_info(card)
+        _reply_lookup(message, format_bank_lookup_reply(info))
+        return True
+
+    if re.match(r"^1\d{10}$", t):
+        if message.chat.type in ("group", "supergroup") and looks_like_billing_command(t, gid):
+            return False
+        info = fetch_phone_info(t)
+        _reply_lookup(message, format_phone_lookup_reply(info))
+        return True
+    return False
+
+
+def process_reply_undo(message, gid, uid, tg_username, today):
+    t = (text or "").strip() if (text := get_message_text(message)) else ""
+    if not message.reply_to_message:
+        return False
+    if not can_operate_in_group(gid, uid, tg_username):
+        bot.reply_to(message, tr(gid, "no_delete_perm"), parse_mode="HTML")
+        return True
+    src_id = message.reply_to_message.message_id
+    if t == "撤销":
+        n = delete_bills_by_source_message(gid, src_id)
+        bot.reply_to(message, f"🗑️ 已撤销 {n} 笔关联账单。" if n else "🔍 未找到可撤销账单。")
+        if n:
+            send_text_bill_report(gid, gid, today)
+        return True
+    m = re.match(r"^撤销入款(\d+)?条?$", t)
+    if m or t == "撤销入款":
+        count = int(m.group(1)) if m and m.group(1) else 1
+        n = delete_bills_by_source_message(gid, src_id, "income", count)
+        if not n:
+            n = delete_recent_bills(gid, "income", count, today)
+        bot.reply_to(message, f"🗑️ 已撤销入款 {n} 笔。")
+        if n:
+            send_text_bill_report(gid, gid, today)
+        return True
+    m = re.match(r"^撤销下发(\d+)?条?$", t)
+    if m or t == "撤销下发":
+        count = int(m.group(1)) if m and m.group(1) else 1
+        n = delete_bills_by_source_message(gid, src_id, "expense", count)
+        if not n:
+            n = delete_recent_bills(gid, "expense", count, today)
+        bot.reply_to(message, f"🗑️ 已撤销下发 {n} 笔。")
+        if n:
+            send_text_bill_report(gid, gid, today)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Billing
 # ---------------------------------------------------------------------------
-def add_bill(group_id, user_id, username, remark, amount, bill_type, exchange_rate=None):
-    if exchange_rate is None:
-        exchange_rate = get_setting(group_id, "exchange_rate") or 7.2
-    usdt_amount = amount / exchange_rate if bill_type == "income" else amount
+def add_bill(
+    group_id, user_id, username, remark, amount, bill_type,
+    exchange_rate=None, source_message_id=None, fee_rate=None, is_usdt_input=False,
+):
+    extra = get_extra_settings(group_id)
+    multiply_mode = bool(extra.get("multiply_rate_mode"))
+    inline_rate = exchange_rate
+
+    if fee_rate is None:
+        fee_rate = get_effective_fee(group_id, bill_type)
+
+    if bill_type == "income":
+        if exchange_rate is None:
+            exchange_rate = get_effective_rate(group_id, "income")
+        if is_usdt_input:
+            usdt_amount = abs(amount)
+            rmb_amount = convert_usdt_to_rmb(usdt_amount, exchange_rate, multiply_mode)
+            if amount < 0:
+                rmb_amount = -rmb_amount
+                usdt_amount = -usdt_amount
+            amount = rmb_amount
+        else:
+            usdt_amount = convert_rmb_to_usdt(abs(amount), exchange_rate, fee_rate, multiply_mode)
+            if amount < 0:
+                usdt_amount = -usdt_amount
+    else:
+        eff_rate = (
+            float(inline_rate)
+            if inline_rate is not None
+            else get_effective_rate(group_id, "expense")
+        )
+        exchange_rate = eff_rate
+        if is_usdt_input:
+            usdt_amount = abs(amount)
+            amount = convert_usdt_to_rmb(usdt_amount, eff_rate, multiply_mode)
+        elif expense_amount_is_rmb(extra, inline_rate, is_usdt_input):
+            rmb_val = abs(amount)
+            usdt_amount = convert_rmb_to_usdt(rmb_val, eff_rate, fee_rate, multiply_mode)
+            amount = rmb_val
+        else:
+            usdt_amount = abs(amount)
+            amount = convert_usdt_to_rmb(usdt_amount, eff_rate, multiply_mode)
+
     tz = get_setting(group_id, "timezone") or "Asia/Shanghai"
-    _, _, full_time = get_current_time(tz)
-    date_str = full_time[:10]
+    date_str, full_time = get_billing_date_str(group_id)
     conn = get_db()
     c = conn.cursor()
     c.execute(
         """
         INSERT INTO bills
         (group_id, user_id, username, remark, amount, usdt_amount, exchange_rate,
-         bill_type, timestamp, date_str, is_settled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+         bill_type, timestamp, date_str, is_settled, source_message_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
         """,
-        (group_id, user_id, username, remark, amount, usdt_amount, exchange_rate, bill_type, full_time, date_str),
+        (
+            group_id, user_id, username, remark, amount, usdt_amount, exchange_rate,
+            bill_type, full_time, date_str, source_message_id,
+        ),
     )
     conn.commit()
     conn.close()
@@ -1443,9 +3300,24 @@ def _tag_rmb(amount):
     return f"<b>{amount:.0f}</b>"
 
 
-def _format_income_line(remark, operator, amount, usdt, rate, timestamp, user_id=None):
-    time_s = timestamp[11:16]
-    core = f"{time_s} {amount:.0f}/{rate:.2f}={usdt:.2f}U"
+def _bill_time_str(timestamp, group_id):
+    extra = get_extra_settings(group_id)
+    fmt = extra.get("time_format") or "hm"
+    if fmt == "hms" and timestamp and len(timestamp) >= 19:
+        return timestamp[11:19]
+    if timestamp and len(timestamp) >= 16:
+        return timestamp[11:16]
+    return ""
+
+
+def _format_income_line(remark, operator, amount, usdt, rate, timestamp, user_id=None, group_id=None):
+    time_s = _bill_time_str(timestamp, group_id) if group_id else (timestamp[11:16] if timestamp else "")
+    extra = get_extra_settings(group_id) if group_id else {}
+    show_rmb = extra.get("show_rmb", True)
+    if show_rmb:
+        core = f"{time_s} {amount:.0f}/{rate:.2f}={usdt:.2f}U"
+    else:
+        core = f"{time_s} {usdt:.2f}U"
     op = _tag_operator(operator, user_id)
     rem = _tag_remark(remark)
     if rem:
@@ -1454,7 +3326,7 @@ def _format_income_line(remark, operator, amount, usdt, rate, timestamp, user_id
 
 
 def _format_expense_line(remark, operator, usdt, timestamp, user_id=None, group_id=None):
-    time_s = timestamp[11:16]
+    time_s = _bill_time_str(timestamp, group_id) if group_id else (timestamp[11:16] if timestamp else "")
     word = tr(group_id, "expense_word") if group_id else "下发"
     core = f"{time_s} {word}{usdt:.2f}U"
     op = _tag_operator(operator, user_id)
@@ -1464,9 +3336,17 @@ def _format_expense_line(remark, operator, usdt, timestamp, user_id=None, group_
     return f"{core} {op}"
 
 
+def _remark_for_category(remark):
+    """分类汇总用：空备注返回 None，不参与「入款备注分类」。"""
+    rem = (remark or "").strip()
+    return rem or None
+
+
 def build_bill_report_text(group_id, target_date, show_all_categories=False):
-    rate = float(get_setting(group_id, "exchange_rate") or 7.2)
-    fee_rate = float(get_setting(group_id, "fee_rate") or 0.0)
+    income_rate = get_effective_rate(group_id, "income")
+    expense_rate = get_effective_rate(group_id, "expense")
+    fee_rate = get_effective_fee(group_id, "income")
+    display_n = int(get_extra_settings(group_id).get("display_count") or 5)
     income, expense, total_income, total_expense = get_class_bills_by_date(group_id, target_date)
 
     total_rmb = float((total_income[0] or 0) if total_income else 0)
@@ -1475,51 +3355,55 @@ def build_bill_report_text(group_id, target_date, show_all_categories=False):
     remaining_usdt = total_usdt - expense_usdt
 
     summary = {}
-    empty_remark = tr(group_id, "no_remark")
     for row in income:
-        rem = (row[0] or "").strip() or empty_remark
+        rem = _remark_for_category(row[0])
+        if not rem:
+            continue
         summary.setdefault(rem, {"rmb": 0.0, "usdt": 0.0})
         summary[rem]["rmb"] += row[2]
         summary[rem]["usdt"] += row[3]
 
     lines = [tr(group_id, "income_header", n=len(income))]
     if income:
-        for row in income[-5:]:
+        for row in income[-display_n:]:
             uid = row[7] if len(row) > 7 else None
-            lines.append(_format_income_line(row[0], row[1], row[2], row[3], row[4], row[5], uid))
+            lines.append(_format_income_line(row[0], row[1], row[2], row[3], row[4], row[5], uid, group_id))
     else:
         lines.append(tr(group_id, "no_income"))
 
-    lines.append("")
-    lines.append(tr(group_id, "category_header"))
     category_items = list(summary.items())
-    visible_categories = category_items if show_all_categories else category_items[:3]
-    if visible_categories:
+    if category_items:
+        lines.append("")
+        lines.append(tr(group_id, "category_header"))
+        visible_categories = category_items if show_all_categories else category_items[:3]
         cate_lines = []
         for key, val in visible_categories:
-            if key != empty_remark:
-                key_label = _tag_remark(key).strip()
-            else:
-                key_label = empty_remark
-            cate_lines.append(f"{key_label} 👉 {_tag_rmb(val['rmb'])}/{val['usdt']:.2f}U")
+            cate_lines.append(f"{_tag_remark(key).strip()} 👉 {_tag_rmb(val['rmb'])}/{val['usdt']:.2f}U")
         lines.append(f"<blockquote>{chr(10).join(cate_lines)}</blockquote>")
-    else:
-        lines.append(f"<blockquote>{tr(group_id, 'no_category')}</blockquote>")
 
     lines.append("")
     lines.append(tr(group_id, "expense_header", n=len(expense)))
     if expense:
-        for row in expense[-5:]:
+        for row in expense[-display_n:]:
             uid = row[6] if len(row) > 6 else None
             lines.append(_format_expense_line(row[0], row[1], row[2], row[4], uid, group_id))
     else:
         lines.append(tr(group_id, "no_expense"))
 
-    lines.extend([
-        "",
+    rate_lines = [
         tr(group_id, "total_income", amount=_tag_rmb(total_rmb)),
         tr(group_id, "fee_rate_label", rate=f"{fee_rate * 100:.0f}"),
-        tr(group_id, "exchange_rate_label", rate=f"{rate:.2f}"),
+    ]
+    if abs(income_rate - expense_rate) < 0.001:
+        rate_lines.append(tr(group_id, "exchange_rate_label", rate=f"{income_rate:.2f}"))
+    else:
+        rate_lines.extend([
+            tr(group_id, "income_rate_label", rate=f"{income_rate:.2f}"),
+            tr(group_id, "expense_rate_label", rate=f"{expense_rate:.2f}"),
+        ])
+    lines.extend([
+        "",
+        *rate_lines,
         "",
         tr(group_id, "should_issue", amount=f"{total_usdt:.2f}"),
         tr(group_id, "issued", amount=f"{expense_usdt:.2f}"),
@@ -1545,15 +3429,21 @@ def send_text_bill_report(chat_id, group_id, target_date):
         tr(group_id, "web_bill"), url=f"{WEBHOOK_URL}/?group_id={group_id}"
     ))
     try:
-        bot.send_message(chat_id, report, parse_mode="HTML", reply_markup=markup)
+        sent = bot.send_message(chat_id, report, parse_mode="HTML", reply_markup=markup)
     except Exception as exc:
         log.exception("账单 HTML 发送失败，改用纯文本: %s", exc)
         plain = re.sub(r"<[^>]+>", "", report)
         try:
-            bot.send_message(chat_id, plain, reply_markup=markup)
+            sent = bot.send_message(chat_id, plain, reply_markup=markup)
         except Exception as exc2:
             log.exception("纯文本账单发送失败: %s", exc2)
             raise exc2 from exc
+    extra = get_extra_settings(group_id)
+    if extra.get("pin_bills"):
+        try:
+            bot.pin_chat_message(chat_id, sent.message_id, disable_notification=True)
+        except Exception as exc:
+            log.warning("pin bill report failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1756,6 +3646,22 @@ def cmd_dbstatus(message):
     )
 
 
+@bot.message_handler(commands=["me", "我"])
+def cmd_self_bill(message):
+    if message.chat.type not in ("group", "supergroup"):
+        bot.reply_to(message, "💡 请在群内使用 /我 或发送「账单」自查。")
+        return
+    gid = message.chat.id
+    uid = message.from_user.id
+    today, _ = get_billing_date_str(gid)
+    display_name = message.from_user.first_name or "用户"
+    bot.reply_to(
+        message,
+        build_self_bill_report(gid, uid, today, display_name),
+        parse_mode="HTML",
+    )
+
+
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     uid = message.from_user.id
@@ -1765,17 +3671,13 @@ def cmd_start(message):
         bot.send_message(
             message.chat.id,
             f"🤖 <b>{get_bot_brand()}智能分布式记账系统已激活</b>\n\n"
-            "👉 <b>群内核心记账命令：</b>\n"
-            "• 发送 <code>上课</code> / <code>下课</code> 开启或封存账单\n"
-            "• 发送 <code>+1000</code> 或 <code>+1000/7.3</code> 记入款\n"
-            "• 发送 <code>项目公款+5000</code> 记带备注账目\n"
-            "• 发送 <code>下发500</code> 记下发\n"
-            "• 发送 <code>+0</code> 查看对账大底\n\n"
-            "⚙️ <b>财务群管命令（买家老板/权限人）：</b>\n"
-            "• <code>设置汇率 7.35</code>\n"
-            "• <code>设置费率 5</code>\n"
-            "• <code>设置操作人 @用户名 @用户名2</code> — 可一次多个\n"
-            "• <code>取掉操作人 @用户名</code>",
+            "📖 完整指令请私聊机器人点 <b>详细说明书</b>（中/英/缅三语）。\n\n"
+            "👉 <b>群内常用：</b>\n"
+            "• <code>开始</code> / <code>关闭</code> 开启或停止记账\n"
+            "• <code>+1000</code>、<code>+1000/7.1</code>、<code>+1000*5</code>、<code>+1000U</code>\n"
+            "• <code>下发500</code>、<code>下发500/7.8</code>、<code>+0</code> 查账\n"
+            "• <code>账单</code> 或 <code>/我</code> 群员自查\n"
+            "• 回复消息：<code>撤销</code>、<code>撤销入款5条</code>",
             parse_mode="HTML",
         )
 
@@ -1830,7 +3732,10 @@ def handle_set_language(call):
         pass
     label = TEXTS[lang_code]["lang_label"]
     bot.send_message(group_id, tr(group_id, "lang_changed", label=label), parse_mode="HTML")
-    send_group_greeting(group_id, group_id)
+    if is_group_active(group_id):
+        bot.send_message(group_id, tr(group_id, "lang_active_hint"), parse_mode="HTML")
+    else:
+        send_group_greeting(group_id, group_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("guide_lang_"))
@@ -2093,12 +3998,62 @@ def handle_all_messages(message):
             bot.reply_to(message, f"❌ 检索失败: {result['msg']}")
         return
 
+    if process_lookup_queries(message, text):
+        return
+
+    # 纯算式优先（群/私聊均可，无需操作人权限）
+    if try_reply_calculator(message, text):
+        return
+
     if message.chat.type not in ("group", "supergroup"):
         return
 
     # --- group commands ---
-    now, _, _ = get_current_time()
-    today = now.strftime("%Y-%m-%d")
+    today, _ = get_billing_date_str(gid)
+
+    if text.strip() == "账单":
+        bot.reply_to(
+            message,
+            build_self_bill_report(gid, uid, today, display_name),
+            parse_mode="HTML",
+        )
+        return
+
+    if process_reply_undo(message, gid, uid, tg_username, today):
+        return
+
+    if process_extended_settings(message, text, gid, uid, tg_username, today):
+        return
+
+    parsed_zero = parse_income_command(text, gid)
+    if parsed_zero and parsed_zero.get("kind") == "bill_zero":
+        try:
+            send_text_bill_report(gid, gid, today)
+        except Exception as exc:
+            log.exception("查账失败: %s", exc)
+            bot.reply_to(message, tr(gid, "bill_fail", err=exc))
+        return
+
+    extra = get_extra_settings(gid)
+    if extra.get("address_detect"):
+        addr_m = re.search(r"\b(T[A-Za-z0-9]{33})\b", text)
+        if addr_m and not looks_like_billing_command(text, gid):
+            addr = addr_m.group(1)
+            result = fetch_blockchain_usdt_info(addr)
+            if result["success"]:
+                bot.reply_to(
+                    message,
+                    f"👤 地址：<code>{addr}</code>\n\n"
+                    f"💰 USDT 余额：<code>{result['balance']:.2f}</code> U\n"
+                    f"━━━━━━━━━━━━━━━━━━\n📊 流向明细：\n{result['history']}",
+                    parse_mode="HTML",
+                )
+                return
+    if extra.get("bank_detect"):
+        card_m = re.search(r"\b(\d{16,19})\b", text)
+        if card_m and not looks_like_billing_command(text, gid):
+            bot.reply_to(message, f"💳 识别到银行卡号：<code>{card_m.group(1)}</code>", parse_mode="HTML")
+            return
 
     if is_language_change_trigger(text, gid):
         if not can_manage_group_operators(uid):
@@ -2111,7 +4066,7 @@ def handle_all_messages(message):
             send_language_picker(gid, gid)
         return
 
-    rate_rest = strip_cmd_prefix(text, cmd(gid, "set_rate"))
+    rate_rest = strip_cmd_prefix_any(text, "set_rate")
     if rate_rest is not None:
         if not can_operate_in_group(gid, uid, tg_username):
             bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
@@ -2119,13 +4074,14 @@ def handle_all_messages(message):
         try:
             rate = float(rate_rest)
             update_setting(gid, "exchange_rate", rate)
+            update_extra_setting(gid, "income_exchange_rate", None)
             bot.reply_to(message, tr(gid, "rate_updated", rate=f"{rate:.2f}"), parse_mode="HTML")
         except ValueError:
             c = cmd(gid, "set_rate")
             bot.reply_to(message, f"❌ 格式错误，例如：{c} 7.3")
         return
 
-    fee_rest = strip_cmd_prefix(text, cmd(gid, "set_fee"))
+    fee_rest = strip_cmd_prefix_any(text, "set_fee")
     if fee_rest is not None:
         if not can_operate_in_group(gid, uid, tg_username):
             bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
@@ -2133,18 +4089,25 @@ def handle_all_messages(message):
         try:
             fee = float(fee_rest) / 100
             update_setting(gid, "fee_rate", fee)
+            update_extra_setting(gid, "income_fee_rate", fee)
             bot.reply_to(message, tr(gid, "fee_updated", rate=f"{fee * 100:.0f}"), parse_mode="HTML")
         except ValueError:
             c = cmd(gid, "set_fee")
             bot.reply_to(message, f"❌ 格式错误，例如：{c} 5")
         return
 
-    op_prefix = cmd(gid, "set_operator")
-    if strip_cmd_prefix(text, op_prefix) is not None:
+    op_prefix = find_cmd_prefix(text, "set_operator")
+    if op_prefix is not None:
         if not can_manage_group_operators(uid):
             bot.reply_to(message, tr(gid, "no_manage_operators"), parse_mode="HTML")
             return
         targets = parse_operator_targets(text, message.entities, op_prefix)
+        if not targets and message.reply_to_message and message.reply_to_message.from_user:
+            ru = message.reply_to_message.from_user
+            if ru.username:
+                targets = [normalize_operator_name(ru.username)]
+            else:
+                targets = [str(ru.id)]
         if not targets:
             bot.reply_to(
                 message,
@@ -2169,8 +4132,8 @@ def handle_all_messages(message):
         return
 
     removed_op = False
-    for rk in ("remove_operator", "remove_operator2"):
-        rest = strip_cmd_prefix(text, cmd(gid, rk))
+    for rk in ("remove_operator", "remove_operator2", "remove_operator3"):
+        rest = strip_cmd_prefix_any(text, rk)
         if rest is None:
             continue
         if not can_manage_group_operators(uid):
@@ -2220,7 +4183,7 @@ def handle_all_messages(message):
         send_text_bill_report(gid, gid, today)
         return
 
-    del_rest = strip_cmd_prefix(text, cmd(gid, "delete_remark"))
+    del_rest = strip_cmd_prefix_any(text, "delete_remark")
     if del_rest is not None and del_rest:
         if not can_operate_in_group(gid, uid, tg_username):
             bot.reply_to(message, tr(gid, "no_delete_perm"), parse_mode="HTML")
@@ -2242,7 +4205,7 @@ def handle_all_messages(message):
             bot.reply_to(message, tr(gid, "delete_remark_none", remark=remark))
         return
 
-    view_rest = strip_cmd_prefix(text, cmd(gid, "view_remark"))
+    view_rest = strip_cmd_prefix_any(text, "view_remark")
     if view_rest is not None:
         if view_rest:
             remark = view_rest
@@ -2276,22 +4239,24 @@ def handle_all_messages(message):
             bot.reply_to(message, f"💡 用法：{c} remark")
         return
 
-    if match_exact(text, gid, "class_start"):
+    if match_class_start(text, gid):
         if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
             return
         update_setting(gid, "is_active", 1)
         bot.reply_to(message, tr(gid, "class_start"))
         return
 
-    if match_exact(text, gid, "class_end"):
+    if match_class_end(text, gid):
         if not can_operate_in_group(gid, uid, tg_username):
+            bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
             return
         update_setting(gid, "is_active", 0)
         bot.reply_to(message, tr(gid, "class_end"))
         send_text_bill_report(gid, gid, today)
         return
 
-    if not get_setting(gid, "is_active"):
+    if not is_group_active(gid):
         if looks_like_billing_command(text, gid):
             bot.reply_to(message, build_need_class_start(gid), parse_mode="HTML")
         return
@@ -2301,27 +4266,43 @@ def handle_all_messages(message):
             bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
         return
 
-    if match_exact(text, gid, "bill_zero"):
-        send_text_bill_report(gid, gid, today)
-        return
-
-    m_exp = expense_match(text, gid)
-    if m_exp:
-        add_bill(gid, uid, display_name, m_exp.group(1).strip(), float(m_exp.group(2)), "expense")
-        send_text_bill_report(gid, gid, today)
-        return
-
-    m_inc = re.match(r"^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$", text)
-    if m_inc:
+    parsed_inc = parse_income_command(text, gid)
+    if parsed_inc:
         try:
-            amount = float(m_inc.group(3))
-            if m_inc.group(2) == "-":
-                amount = -amount
-            rate = float(m_inc.group(4)) if m_inc.group(4) else None
-            add_bill(gid, uid, display_name, m_inc.group(1).strip(), amount, "income", rate)
+            fee_rate = None
+            if parsed_inc.get("fee_pct") is not None:
+                fee_rate = float(parsed_inc["fee_pct"]) / 100.0
+            add_bill(
+                gid, uid, display_name,
+                parsed_inc.get("remark", ""),
+                parsed_inc["amount"],
+                "income",
+                exchange_rate=parsed_inc.get("rate"),
+                source_message_id=message.message_id,
+                fee_rate=fee_rate,
+                is_usdt_input=parsed_inc.get("is_usdt", False),
+            )
             send_text_bill_report(gid, gid, today)
         except Exception as exc:
             log.exception("记入款失败: %s", exc)
+            bot.reply_to(message, tr(gid, "bill_fail", err=exc))
+        return
+
+    parsed_exp = parse_expense_command(text, gid)
+    if parsed_exp:
+        try:
+            add_bill(
+                gid, uid, display_name,
+                parsed_exp.get("remark", ""),
+                parsed_exp["amount"],
+                "expense",
+                exchange_rate=parsed_exp.get("rate"),
+                source_message_id=message.message_id,
+                is_usdt_input=parsed_exp.get("is_usdt", False),
+            )
+            send_text_bill_report(gid, gid, today)
+        except Exception as exc:
+            log.exception("记下发失败: %s", exc)
             bot.reply_to(message, tr(gid, "bill_fail", err=exc))
         return
 
@@ -2554,7 +4535,8 @@ def api_bill():
     target_date = request.args.get("date") or server_today
 
     income, expense, total_income, total_expense = get_class_bills_by_date(group_id, target_date)
-    rate = get_setting(group_id, "exchange_rate") or 7.2
+    income_rate = get_effective_rate(group_id, "income")
+    expense_rate = get_effective_rate(group_id, "expense")
     total_rmb = (total_income[0] or 0) if total_income else 0
     total_usdt = (total_income[1] or 0) if total_income else 0
     expense_usdt = (total_expense[0] or 0) if total_expense else 0
@@ -2583,7 +4565,9 @@ def api_bill():
 
     summary = {}
     for row in income:
-        rem = (row[0] or "").strip() or empty_remark
+        rem = _remark_for_category(row[0])
+        if not rem:
+            continue
         summary.setdefault(rem, {"total_rmb": 0.0, "total_usdt": 0.0, "count": 0})
         summary[rem]["total_rmb"] += row[2] or 0
         summary[rem]["total_usdt"] += row[3] or 0
@@ -2600,8 +4584,10 @@ def api_bill():
     ]
 
     return jsonify({
-        "exchange_rate": f"{rate:.2f}",
-        "rate": f"{rate:.2f}",
+        "exchange_rate": f"{income_rate:.2f}",
+        "income_rate": f"{income_rate:.2f}",
+        "expense_rate": f"{expense_rate:.2f}",
+        "rate": f"{income_rate:.2f}",
         "total_rmb": f"{total_rmb:.0f}",
         "total_usdt": f"{total_usdt:.2f}",
         "expense_usdt": f"{expense_usdt:.2f}",
@@ -2681,6 +4667,6 @@ def setup_webhook():
 
 
 if __name__ == "__main__":
-    log.info("Starting on 0.0.0.0:%s  WEBHOOK_URL=%s", PORT, WEBHOOK_URL)
+    log.info("Starting xiaocaicai_plus on 0.0.0.0:%s  WEBHOOK_URL=%s  DB=%s", PORT, WEBHOOK_URL, DATABASE_PATH)
     setup_webhook()
     flask_app.run(host="0.0.0.0", port=PORT)
