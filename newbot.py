@@ -738,7 +738,8 @@ def build_manual_guide_text(lang="zh"):
             "├ Huobi OTC <code>H0</code>\n"
             "├ MYR OTC <code>m0</code>\n"
             "├ Bybit MMK quick <code>mm0</code> · all <code>bma</code>\n"
-            "├ Bybit KBZPay <code>bkb</code> · Mobile Banking <code>bmm</code>\n"
+            "├ Bybit KBZPay buy <code>bkb</code> · Mobile <code>bmm</code>\n"
+            "├ Bybit sell U KBZ <code>skb</code> · Bank Transfer <code>smm</code>\n"
             "├ OKX all buy <code>la</code> · bank buy <code>lk</code> · Alipay buy <code>lz</code> · WeChat buy <code>lw</code>\n"
             "├ OKX bank sell <code>lmk</code> · Alipay sell <code>lmz</code> · WeChat sell <code>lmw</code>\n"
             "├ Convert <code>查汇率100</code>\n"
@@ -875,6 +876,8 @@ def build_manual_guide_text(lang="zh"):
         "├ 缅币全部买价 <code>bma</code>（KBZ + Mobile Banking）\n"
         "├ KBZ 买U Top10 <code>bkb</code>\n"
         "├ Mobile Banking 买U Top10 <code>bmm</code>\n"
+        "├ U换KBZ Top10 <code>skb</code>\n"
+        "├ U换Bank Transfer Top10 <code>smm</code>\n"
         "├ 欧易全部买价 <code>la</code>\n"
         "├ 欧易银行卡买价 <code>lk</code> · 支付宝买价 <code>lz</code> · 微信买价 <code>lw</code>\n"
         "├ 欧易银行卡卖价 <code>lmk</code> · 支付宝卖价 <code>lmz</code> · 微信卖价 <code>lmw</code>\n"
@@ -2112,11 +2115,17 @@ MMK_QUERY_COMMANDS = {
     "bkb": "KBZPay",
     "bmm": "Mobile Banking",
 }
+MMK_SELL_QUERY_COMMANDS = {
+    "skb": "KBZPay",
+    "smm": "Mobile Banking",
+}
 MMK_COMMAND_HELP = {
-    "mm0": "缅币 OTC 快查",
-    "bma": "KBZ + Mobile Banking Top10",
-    "bkb": "KBZPay Top10",
-    "bmm": "Mobile Banking Top10",
+    "mm0": "缅币买U快查",
+    "bma": "全部渠道买U Top10",
+    "bkb": "KBZ买U Top10",
+    "bmm": "Mobile Banking买U Top10",
+    "skb": "U换KBZ Top10",
+    "smm": "U换Bank Transfer Top10",
 }
 OTC_COMMAND_HELP = {
     "Z0": "欧易 OTC 汇率",
@@ -2254,9 +2263,9 @@ def fetch_bybit_p2p_orders(currency, payment_ids, side="1", limit=10):
     return None
 
 
-def fetch_mmk_p2p_orders(payment_ids, limit=10):
-    """缅币 P2P：优先 Bybit，备用 Binance。"""
-    orders = fetch_bybit_p2p_orders("MMK", payment_ids, "1", limit)
+def fetch_mmk_p2p_orders(payment_ids, limit=10, side="1"):
+    """缅币 P2P：优先 Bybit，备用 Binance。side=1 买U，side=0 卖U。"""
+    orders = fetch_bybit_p2p_orders("MMK", payment_ids, str(side), limit)
     if orders is not None:
         return orders, "Bybit"
     binance_map = {
@@ -2270,7 +2279,8 @@ def fetch_mmk_p2p_orders(payment_ids, limit=10):
         binance_pay = [binance_map.get(p, p) for p in payment_ids]
     else:
         binance_pay = []
-    orders = fetch_binance_p2p_orders("MMK", binance_pay, "SELL", limit)
+    trade_type = "SELL" if str(side) == "1" else "BUY"
+    orders = fetch_binance_p2p_orders("MMK", binance_pay, trade_type, limit)
     if orders is not None:
         return orders, "Binance"
     return None, "Bybit"
@@ -2285,7 +2295,15 @@ def _format_mmk_limit(min_amount, max_amount):
         return ""
 
 
-def format_mmk_p2p_section(payment_label, orders, source="Bybit"):
+def format_mmk_p2p_section(payment_label, orders, source="Bybit", trade_side="buy"):
+    if trade_side == "sell":
+        action = "卖出"
+        prefix = "卖"
+        title = f"当前{source}-{payment_label} USDT卖出价（U换{payment_label}）"
+    else:
+        action = "购买"
+        prefix = "买"
+        title = f"当前设置{source}-{payment_label} USDT{action}价"
     if orders is None:
         return (
             f"⚠️ 暂时无法连接 {source}-{payment_label} P2P\n"
@@ -2296,13 +2314,13 @@ def format_mmk_p2p_section(payment_label, orders, source="Bybit"):
             f"⚠️ {source}-{payment_label} 当前 P2P 无挂单\n"
             "请稍后再试，或在 Bybit App 的 P2P 缅甸区核对。"
         )
-    lines = [f"当前设置{source}-{payment_label} USDT购买价"]
+    lines = [title]
     for idx, row in enumerate(orders, 1):
         limit_text = _format_mmk_limit(row.get("minAmount"), row.get("maxAmount"))
         if limit_text:
-            lines.append(f"买{idx}：{row['price']:.2f}   {row['nickName']}   {limit_text}")
+            lines.append(f"{prefix}{idx}：{row['price']:.2f}   {row['nickName']}   {limit_text}")
         else:
-            lines.append(f"买{idx}：{row['price']:.2f}   {row['nickName']}")
+            lines.append(f"{prefix}{idx}：{row['price']:.2f}   {row['nickName']}")
     return "\n".join(lines)
 
 
@@ -2321,6 +2339,17 @@ def build_mmk_p2p_reply(command):
         payment_ids = MMK_QUERY_PAYMENT_IDS.get(pay_label, [])
         orders, source = fetch_mmk_p2p_orders(payment_ids, 10)
         body = format_mmk_p2p_section(pay_label, orders, source)
+    return append_query_command_footer(body, MMK_COMMAND_HELP, cmd)
+
+
+def build_mmk_p2p_sell_reply(command):
+    cmd = (command or "").lower()
+    pay_label = MMK_SELL_QUERY_COMMANDS.get(cmd)
+    if not pay_label:
+        return None
+    payment_ids = MMK_QUERY_PAYMENT_IDS.get(pay_label, [])
+    orders, source = fetch_mmk_p2p_orders(payment_ids, 10, side="0")
+    body = format_mmk_p2p_section(pay_label, orders, source, trade_side="sell")
     return append_query_command_footer(body, MMK_COMMAND_HELP, cmd)
 
 
@@ -2585,9 +2614,11 @@ def process_extended_settings(message, text, gid, uid, tg_username, today):
             body = (
                 "⚠️ <b>Bybit MMK P2P 当前无 USDT 卖单</b>\n\n"
                 "请试分渠道命令：\n"
-                "• <code>bkb</code> — KBZPay Top10\n"
-                "• <code>bmm</code> — Mobile Banking Top10\n"
-                "• <code>bma</code> — 以上两种各 Top10"
+                "• <code>bkb</code> — KBZPay 买U Top10\n"
+                "• <code>bmm</code> — Mobile Banking 买U Top10\n"
+                "• <code>skb</code> — U换KBZ Top10\n"
+                "• <code>smm</code> — U换Bank Transfer Top10\n"
+                "• <code>bma</code> — 以上买U渠道各 Top10"
             )
         else:
             body = format_rate_reply("Bybit MMK P2P", rate, note)
@@ -2596,6 +2627,14 @@ def process_extended_settings(message, text, gid, uid, tg_username, today):
             append_query_command_footer(body, MMK_COMMAND_HELP, "mm0"),
             parse_mode="HTML",
         )
+        return True
+
+    if t.lower() in MMK_SELL_QUERY_COMMANDS:
+        try:
+            bot.reply_to(message, build_mmk_p2p_sell_reply(t))
+        except Exception as exc:
+            log.exception("MMK P2P sell query failed: %s", exc)
+            bot.reply_to(message, f"⚠️ MMK 卖U查询失败，请稍后重试。（{exc}）")
         return True
 
     if t.lower() in MMK_QUERY_COMMANDS:
