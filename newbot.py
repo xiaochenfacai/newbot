@@ -1112,7 +1112,7 @@ TEXTS = {
         "need_class_start": "⚠️ 请先发送「上课」开启记账。",
         "no_operate_perm": "⚠️ 您不是本群操作人，无权记账。请联系买家设置操作人。",
         "no_manage_operators": "⚠️ 只有买家或二级权限人才能执行此操作。",
-        "no_delete_perm": "⚠️ 无权删账。",
+        "no_delete_perm": "⚠️ 无权撤销账单。",
         "rate_updated": "✅ 汇率已调整为 <b>{rate}</b>",
         "fee_updated": "✅ 费率已更新为 {rate}%",
         "operators_added": "✅ 已设为本群操作人：{names}",
@@ -1325,29 +1325,24 @@ def cmd_variants(key):
         val = CMD.get(lang, {}).get(key)
         if val:
             seen.add(val)
-    for val in DELETE_CMD_LEGACY_ALIASES.get(key, ()):
+    for val in UNDO_CMD_EXTRA_ALIASES.get(key, ()):
         seen.add(val)
     return seen
 
 
-DELETE_CMD_LEGACY_ALIASES = {
-    "delete_last": ("删最后",),
-    "delete_today": ("删今天", "删除账单", "撤销账单"),
-    "delete_all": ("删全部",),
-    "delete_remark": ("删",),
+UNDO_CMD_EXTRA_ALIASES = {
+    "delete_today": ("撤销账单",),
 }
 
 
 def parse_remark_delete_command(text):
-    """按备注撤销今日入款：撤销 张三 / 删 张三 / 删张三（兼容）。"""
+    """按备注撤销今日入款：撤销 张三 / 撤销备注张三。"""
     t = (text or "").strip()
     if not t:
         return None
     for pattern in (
         r"^撤销\s+(.+)$",
-        r"^删\s+(.+)$",
         r"^撤销备注\s*(.+)$",
-        r"^删备注\s*(.+)$",
     ):
         m = re.match(pattern, t)
         if not m:
@@ -2828,7 +2823,7 @@ def process_extended_settings(message, text, gid, uid, tg_username, today):
         bot.reply_to(message, "✅ 已删除下发地址。", parse_mode="HTML")
         return True
 
-    if t in ("删除账单", "撤销账单", "撤销今天", "删今天"):
+    if match_exact(t, gid, "delete_today"):
         if not can_operate_in_group(gid, uid, tg_username):
             bot.reply_to(message, tr(gid, "no_delete_perm"), parse_mode="HTML")
             return True
