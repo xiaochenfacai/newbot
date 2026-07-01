@@ -1912,6 +1912,70 @@ def parse_star_modifier(text):
     return mult, fee_pct
 
 
+_CONVERSATIONAL_TAIL_RE = re.compile(
+    r"(是不是|对不对|是对|没错|正确|没问题|好吗|好的|是吧|对吗|不对|错了|可以吗|应该|已经|还是|就是|不是|有没有|可以|行了|好吧|嗯嗯|哦哦|哈哈)"
+)
+
+
+def _billing_tail_residual(tail):
+    """去掉 *倍数、/汇率 后，看尾部还剩什么。"""
+    tail_clean = re.sub(r"\*(\d+(?:\.\d+)?%?)", "", (tail or "").strip()).strip()
+    rate_m = re.search(r"/(\d+(?:\.\d+)?)", tail_clean)
+    if rate_m:
+        return tail_clean[rate_m.end():].strip()
+    return tail_clean
+
+
+def _looks_like_conversational_text(text):
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _CONVERSATIONAL_TAIL_RE.search(t):
+        return True
+    if re.search(r"[，。！？、；：（）()\"'「」『』]", t):
+        return True
+    return False
+
+
+def _consume_chained_plus_amounts(first_sign, first_num, tail):
+    """老弟+3000+300+200 → 合计 3500，并返回链式金额后的剩余 tail。"""
+    total = float(first_num)
+    if first_sign == "-":
+        total = -total
+    rest = tail or ""
+    while rest.startswith(("+", "-")):
+        m = re.match(r"^[+\-](\d+(?:\.\d+)?)(?P<rest>.*)$", rest)
+        if not m:
+            break
+        val = float(m.group(1))
+        if rest[0] == "-":
+            val = -val
+        total += val
+        rest = m.group("rest") or ""
+    return total, rest.strip()
+
+
+def _billing_only_tail(tail):
+    """尾部是否为空，或仅含 *倍数、/汇率 等记账修饰。"""
+    t = (tail or "").strip()
+    if not t:
+        return True
+    t = re.sub(r"\*(\d+(?:\.\d+)?%?)", "", t).strip()
+    t = re.sub(r"/(\d+(?:\.\d+)?)", "", t).strip()
+    return not t
+
+
+def _income_tail_invalid(prefix, tail):
+    if (prefix or "").strip():
+        return not _billing_only_tail(tail)
+    residual = _billing_tail_residual(tail)
+    return _looks_like_conversational_text(residual)
+
+
+def _expense_tail_invalid(prefix, tail):
+    return _income_tail_invalid(prefix, tail)
+
+
 def parse_income_command(text, group_id):
     text = normalize_billing_text(text)
     if is_pure_arithmetic_expression(text):
@@ -1931,6 +1995,10 @@ def parse_income_command(text, group_id):
     base_amount = float(m.group("num"))
     is_usdt = bool(m.group("usdt"))
     tail = (m.group("tail") or "").strip()
+    chained_total, tail = _consume_chained_plus_amounts(sign, base_amount, tail)
+    if (prefix or "").strip():
+        if not _billing_only_tail(tail):
+            return None
     mult, inline_fee = parse_star_modifier(tail)
     tail_clean = re.sub(r"\*(\d+(?:\.\d+)?%?)", "", tail).strip()
     rate = None
@@ -1941,9 +2009,11 @@ def parse_income_command(text, group_id):
         suffix_remark = tail_clean[rate_m.end():].strip()
     else:
         suffix_remark = tail_clean.strip()
+    if not (prefix or "").strip() and _looks_like_conversational_text(suffix_remark):
+        return None
     remark = prefix or suffix_remark
-    amount = base_amount * mult
-    if sign == "-":
+    amount = abs(chained_total) * mult
+    if chained_total < 0:
         amount = -amount
     return {
         "kind": "income",
@@ -1980,6 +2050,8 @@ def parse_expense_command(text, group_id):
         amount = base_amount * mult
         if sign == "-":
             amount = -amount
+        if _expense_tail_invalid(prefix, tail):
+            continue
         return {
             "kind": "expense",
             "remark": prefix,
