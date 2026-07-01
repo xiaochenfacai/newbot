@@ -698,8 +698,11 @@ def build_manual_guide_text(lang="zh"):
             "├ Undo deposit <code>撤销入款</code>\n"
             "├ Undo N deposits <code>撤销入款5条</code>\n"
             "├ Undo N payouts <code>撤销下发5条</code>\n"
+            "├ Undo last <code>撤销最后</code>\n"
+            "├ Clear today <code>撤销今天</code> / <code>撤销账单</code>\n"
+            "├ Clear all <code>撤销全部</code>\n"
+            "├ Undo remark deposits <code>撤销 张三</code>\n"
             "├ Sync bill rate <code>修改汇款10</code>\n"
-            "├ Clear today <code>删除账单</code>\n"
             "└ Halt <code>拉停</code>\n\n"
             "⚙️ <b>Settings</b> (operator+)\n"
             "├ Fee <code>设置费率10</code> (negative % OK, default: income)\n"
@@ -779,8 +782,11 @@ def build_manual_guide_text(lang="zh"):
             "├ ဝင်ငွေပယ် <code>撤销入款</code>\n"
             "├ ဝင်ငွေ N ခုပယ် <code>撤销入款5条</code>\n"
             "├ ထုတ် N ခုပယ် <code>撤销下发5条</code>\n"
+            "├ နောက်ဆုံးပယ် <code>撤销最后</code>\n"
+            "├ ယနေ့ပယ် <code>撤销今天</code> / <code>撤销账单</code>\n"
+            "├ အားလုံးပယ် <code>撤销全部</code>\n"
+            "├ မှတ်ချက်ဝင်ငွေပယ် <code>撤销 张三</code>\n"
             "├ နှုန်းညှိ <code>修改汇款10</code>\n"
-            "├ ယနေ့ဖျက် <code>删除账单</code>\n"
             "└ ရပ်တန့် <code>拉停</code>\n\n"
             "⚙️ <b>ဆettings</b>\n"
             "├ အခကြေးငွေ <code>设置费率10</code>\n"
@@ -833,8 +839,11 @@ def build_manual_guide_text(lang="zh"):
         "├ 撤销入款（回复消息）<code>撤销入款</code>\n"
         "├ 撤销多条入款（回复消息）<code>撤销入款5条</code>\n"
         "├ 撤销多条下发（回复消息）<code>撤销下发5条</code>\n"
+        "├ 撤销最后 <code>撤销最后</code>\n"
+        "├ 撤销今天 <code>撤销今天</code> / <code>撤销账单</code>\n"
+        "├ 撤销全部 <code>撤销全部</code>\n"
+        "├ 撤销备注入款 <code>撤销 张三</code>\n"
         "├ 修改汇款 <code>修改汇款10</code>（同步更新账单汇率）\n"
-        "├ 清空账单 <code>删除账单</code>\n"
         "└ 拉停 <code>拉停</code>\n\n"
         "⚙️ <b>设置操作</b>（需操作权限）\n"
         "├ 设置费率 <code>设置费率10</code>（支持负数%，默认入款）\n"
@@ -1114,7 +1123,7 @@ TEXTS = {
         "no_bills": "📭 暂无账单。",
         "delete_today_ok": "🗑️ 已清空今日 ({date}) 账单。",
         "delete_all_ok": "🗑️ 已清空本群全部历史账单。",
-        "delete_remark_ok": "🗑️ 已删除今日备注【{remark}】共 {n} 笔进单。",
+        "delete_remark_ok": "🗑️ 已撤销今日备注【{remark}】共 {n} 笔进单。",
         "delete_remark_none": "🔍 今日无备注【{remark}】的进单。",
         "view_remark_none": "🔍 今日无备注【{remark}】的进单。",
         "view_remark_title": "📋 <b>{remark}进单明细</b>",
@@ -1252,10 +1261,10 @@ CMD = {
         "remove_operator": "取掉操作人",
         "remove_operator2": "取消操作人",
         "remove_operator3": "移除操作人",
-        "delete_last": "删最后",
-        "delete_today": "删今天",
-        "delete_all": "删全部",
-        "delete_remark": "删",
+        "delete_last": "撤销最后",
+        "delete_today": "撤销今天",
+        "delete_all": "撤销全部",
+        "delete_remark": "撤销",
         "view_remark": "查看",
         "view_chain": "查看",
         "bill_zero": "+0",
@@ -1316,7 +1325,42 @@ def cmd_variants(key):
         val = CMD.get(lang, {}).get(key)
         if val:
             seen.add(val)
+    for val in DELETE_CMD_LEGACY_ALIASES.get(key, ()):
+        seen.add(val)
     return seen
+
+
+DELETE_CMD_LEGACY_ALIASES = {
+    "delete_last": ("删最后",),
+    "delete_today": ("删今天", "删除账单", "撤销账单"),
+    "delete_all": ("删全部",),
+    "delete_remark": ("删",),
+}
+
+
+def parse_remark_delete_command(text):
+    """按备注撤销今日入款：撤销 张三 / 删 张三 / 删张三（兼容）。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    for pattern in (
+        r"^撤销\s+(.+)$",
+        r"^删\s+(.+)$",
+        r"^撤销备注\s*(.+)$",
+        r"^删备注\s*(.+)$",
+    ):
+        m = re.match(pattern, t)
+        if not m:
+            continue
+        remark = m.group(1).strip()
+        if remark and not re.match(r"^(入款|下发)", remark):
+            return remark
+    rest = strip_cmd_prefix_any(t, "delete_remark")
+    if rest and not re.match(r"^(入款|下发)", rest):
+        blocked = cmd_variants("delete_last") | cmd_variants("delete_today") | cmd_variants("delete_all")
+        if t not in blocked and rest not in ("最后", "今天", "全部", "账单"):
+            return rest
+    return None
 
 
 def is_group_active(group_id):
@@ -2784,7 +2828,7 @@ def process_extended_settings(message, text, gid, uid, tg_username, today):
         bot.reply_to(message, "✅ 已删除下发地址。", parse_mode="HTML")
         return True
 
-    if t == "删除账单":
+    if t in ("删除账单", "撤销账单", "撤销今天", "删今天"):
         if not can_operate_in_group(gid, uid, tg_username):
             bot.reply_to(message, tr(gid, "no_delete_perm"), parse_mode="HTML")
             return True
@@ -4222,12 +4266,12 @@ def handle_all_messages(message):
         send_text_bill_report(gid, gid, today)
         return
 
-    del_rest = strip_cmd_prefix_any(text, "delete_remark")
-    if del_rest is not None and del_rest:
+    del_remark = parse_remark_delete_command(text)
+    if del_remark:
         if not can_operate_in_group(gid, uid, tg_username):
             bot.reply_to(message, tr(gid, "no_delete_perm"), parse_mode="HTML")
             return
-        remark = del_rest
+        remark = del_remark
         conn = get_db()
         c = conn.cursor()
         c.execute(
