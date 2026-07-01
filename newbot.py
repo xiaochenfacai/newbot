@@ -690,7 +690,8 @@ def build_manual_guide_text(lang="zh"):
             "├ Payout + rate <code>下发1000/7.8</code>\n"
             "├ Payout in USDT <code>下发5000U</code>\n"
             "├ View bill <code>+0</code>\n"
-            "├ Member self-check <code>账单</code> or <code>/me</code>\n"
+            "├ Member self-check <code>/账单</code> or <code>/me</code> (match remark to your name/@username)\n"
+            "├ Operator self-log <code>/我记的</code>\n"
             "├ Start <code>开始</code> (alias: <code>上课</code>)\n"
             "└ Stop <code>关闭</code> (alias: <code>下课</code> / <code>拉停</code>)\n\n"
             "✏️ <b>Edits</b> (reply to a message)\n"
@@ -774,7 +775,7 @@ def build_manual_guide_text(lang="zh"):
             "├ ထုတ်+နှုန်း <code>下发1000/7.8</code>\n"
             "├ USDT ထုတ် <code>下发5000U</code>\n"
             "├ ဘီလ်ကြည့် <code>+0</code>\n"
-            "├ ကိုယ်တိုင်ကြည့် <code>账单</code> / <code>/me</code>\n"
+            "├ ကိုယ်တိုင်ကြည့် <code>/账单</code> / <code>/me</code>\n"
             "├ စတင် <code>开始</code>（<code>上课</code>）\n"
             "└ ပိတ် <code>关闭</code>（<code>下课</code> / <code>拉停</code>）\n\n"
             "✏️ <b>ပြင်ဆင်</b>（မက်ဆေ့ချ်ကို reply）\n"
@@ -831,7 +832,8 @@ def build_manual_guide_text(lang="zh"):
         "├ 下发+汇率 <code>下发1000/7.8</code>\n"
         "├ 下发U <code>下发5000U</code>\n"
         "├ 查账单 <code>+0</code>\n"
-        "├ 群员自查 <code>账单</code> 或 <code>/我</code>\n"
+        "├ 群员自查 <code>/账单</code> 或 <code>/我</code>（按 Telegram 昵称/@用户名 匹配备注）\n"
+        "├ 操作人查自己记的 <code>/我记的</code>\n"
         "├ 开始记账 <code>开始</code>（兼容 <code>上课</code>）\n"
         "└ 停止记账 <code>关闭</code>（兼容 <code>下课</code> / <code>拉停</code>）\n\n"
         "✏️ <b>修改操作</b>\n"
@@ -1067,9 +1069,9 @@ def looks_like_billing_command(text, group_id):
         return True
     if match_class_start(text, group_id) or match_class_end(text, group_id):
         return True
-    if parse_income_command(text, group_id):
-        return True
     if parse_expense_command(text, group_id):
+        return True
+    if parse_income_command(text, group_id):
         return True
     return False
 
@@ -1957,7 +1959,7 @@ def parse_expense_command(text, group_id):
     text = normalize_billing_text(text)
     for word in sorted(cmd_variants("expense"), key=len, reverse=True):
         m = re.match(
-            rf"^(?P<prefix>.*?)(?:{re.escape(word)})(?P<num>\d+(?:\.\d+)?)"
+            rf"^(?P<prefix>.*?)(?:{re.escape(word)})(?P<sign>[\+\-])?(?P<num>\d+(?:\.\d+)?)"
             r"(?P<usdt>[Uu])?"
             r"(?P<tail>.*)$",
             text,
@@ -1965,6 +1967,7 @@ def parse_expense_command(text, group_id):
         if not m:
             continue
         prefix = m.group("prefix").strip()
+        sign = m.group("sign") or "+"
         base_amount = float(m.group("num"))
         is_usdt = bool(m.group("usdt"))
         tail = (m.group("tail") or "").strip()
@@ -1975,6 +1978,8 @@ def parse_expense_command(text, group_id):
         if rate_m:
             rate = float(rate_m.group(1))
         amount = base_amount * mult
+        if sign == "-":
+            amount = -amount
         return {
             "kind": "expense",
             "remark": prefix,
@@ -2564,23 +2569,66 @@ def update_bills_exchange_rate(group_id, new_rate, target_date=None):
     return updated
 
 
-def get_user_bills_today(group_id, user_id, target_date):
+def get_member_bill_aliases(from_user):
+    """群员自查：用 Telegram 昵称/用户名匹配操作人记账时的备注名。"""
+    aliases = set()
+    if not from_user:
+        return []
+    first = (from_user.first_name or "").strip()
+    last = (from_user.last_name or "").strip()
+    uname = (from_user.username or "").strip()
+    if first:
+        aliases.add(first)
+    if last:
+        aliases.add(last)
+    if first and last:
+        aliases.add(f"{first} {last}")
+    if uname:
+        aliases.add(uname)
+        aliases.add(f"@{uname}")
+        aliases.add(uname.lower())
+        aliases.add(f"@{uname.lower()}")
+    return sorted(a for a in aliases if a)
+
+
+def get_member_bills_today(group_id, user_id, target_date, remark_aliases):
     conn = get_db()
     c = conn.cursor()
-    c.execute(
-        "SELECT bill_type, remark, amount, usdt_amount, timestamp FROM bills "
-        "WHERE group_id = ? AND date_str = ? AND user_id = ? ORDER BY id ASC",
-        (group_id, target_date, user_id),
-    )
+    if remark_aliases:
+        placeholders = ",".join("?" * len(remark_aliases))
+        c.execute(
+            "SELECT bill_type, remark, amount, usdt_amount, timestamp FROM bills "
+            f"WHERE group_id = ? AND date_str = ? AND (user_id = ? OR remark IN ({placeholders})) "
+            "ORDER BY id ASC",
+            [group_id, target_date, user_id, *remark_aliases],
+        )
+    else:
+        c.execute(
+            "SELECT bill_type, remark, amount, usdt_amount, timestamp FROM bills "
+            "WHERE group_id = ? AND date_str = ? AND user_id = ? ORDER BY id ASC",
+            (group_id, target_date, user_id),
+        )
     rows = c.fetchall()
     conn.close()
     return rows
 
 
-def build_self_bill_report(group_id, user_id, target_date, display_name):
-    rows = get_user_bills_today(group_id, user_id, target_date)
+def build_self_bill_report(group_id, from_user, target_date, operator_only=False):
+    display_name = (from_user.first_name if from_user else None) or "用户"
+    user_id = from_user.id if from_user else 0
+    if operator_only:
+        rows = get_member_bills_today(group_id, user_id, target_date, [])
+        title = f"📝 <b>{_html_esc(display_name)}</b> 今日记账统计 ({target_date})"
+        empty_msg = f"📭 <b>{_html_esc(display_name)}</b> 今日您尚未记账（0 笔）。"
+    else:
+        remark_aliases = get_member_bill_aliases(from_user)
+        rows = get_member_bills_today(group_id, user_id, target_date, remark_aliases)
+        title = f"👤 <b>{_html_esc(display_name)}</b> 今日自查 ({target_date})"
+        empty_msg = f"📭 <b>{_html_esc(display_name)}</b> 今日暂无与您姓名/用户名匹配的账单。"
+        if remark_aliases:
+            empty_msg += f"\n（已匹配备注：{_html_esc(' / '.join(remark_aliases))}）"
     if not rows:
-        return f"📭 <b>{_html_esc(display_name)}</b> 今日暂无个人账单。"
+        return empty_msg
     income_lines, expense_lines = [], []
     total_in, total_out = 0.0, 0.0
     for bill_type, remark, amount, usdt, ts in rows:
@@ -2592,12 +2640,13 @@ def build_self_bill_report(group_id, user_id, target_date, display_name):
         else:
             expense_lines.append(f"{time_s} {rem} {usdt:.2f}U")
             total_out += usdt or 0
-    parts = [f"👤 <b>{_html_esc(display_name)}</b> 今日自查 ({target_date})"]
+    total_count = len(income_lines) + len(expense_lines)
+    parts = [f"{title} · 共 <b>{total_count}</b> 笔"]
     if income_lines:
-        parts.append("\n<b>入款</b>\n" + "\n".join(income_lines))
+        parts.append(f"\n<b>入款（{len(income_lines)} 笔）</b>\n" + "\n".join(income_lines))
         parts.append(f"入款合计：<b>{total_in:.2f}U</b>")
     if expense_lines:
-        parts.append("\n<b>下发</b>\n" + "\n".join(expense_lines))
+        parts.append(f"\n<b>下发（{len(expense_lines)} 笔）</b>\n" + "\n".join(expense_lines))
         parts.append(f"下发合计：<b>{total_out:.2f}U</b>")
     return "\n".join(parts)
 
@@ -3246,16 +3295,26 @@ def add_bill(
             else get_effective_rate(group_id, "expense")
         )
         exchange_rate = eff_rate
+        negative = amount < 0
         if is_usdt_input:
             usdt_amount = abs(amount)
             amount = convert_usdt_to_rmb(usdt_amount, eff_rate, multiply_mode)
+            if negative:
+                usdt_amount = -usdt_amount
+                amount = -amount
         elif expense_amount_is_rmb(extra, inline_rate, is_usdt_input):
             rmb_val = abs(amount)
             usdt_amount = convert_rmb_to_usdt(rmb_val, eff_rate, fee_rate, multiply_mode)
             amount = rmb_val
+            if negative:
+                usdt_amount = -usdt_amount
+                amount = -amount
         else:
             usdt_amount = abs(amount)
             amount = convert_usdt_to_rmb(usdt_amount, eff_rate, multiply_mode)
+            if negative:
+                usdt_amount = -usdt_amount
+                amount = -amount
 
     tz = get_setting(group_id, "timezone") or "Asia/Shanghai"
     date_str, full_time = get_billing_date_str(group_id)
@@ -3724,18 +3783,30 @@ def cmd_dbstatus(message):
     )
 
 
-@bot.message_handler(commands=["me", "我"])
+@bot.message_handler(commands=["me", "我", "账单"])
 def cmd_self_bill(message):
     if message.chat.type not in ("group", "supergroup"):
-        bot.reply_to(message, "💡 请在群内使用 /我 或发送「账单」自查。")
+        bot.reply_to(message, "💡 请在群内使用 <code>/账单</code> 或 <code>/我</code> 自查。", parse_mode="HTML")
         return
     gid = message.chat.id
-    uid = message.from_user.id
     today, _ = get_billing_date_str(gid)
-    display_name = message.from_user.first_name or "用户"
     bot.reply_to(
         message,
-        build_self_bill_report(gid, uid, today, display_name),
+        build_self_bill_report(gid, message.from_user, today),
+        parse_mode="HTML",
+    )
+
+
+@bot.message_handler(commands=["我记的"])
+def cmd_operator_bill_log(message):
+    if message.chat.type not in ("group", "supergroup"):
+        bot.reply_to(message, "💡 请在群内使用 <code>/我记的</code> 查询今日记账统计。", parse_mode="HTML")
+        return
+    gid = message.chat.id
+    today, _ = get_billing_date_str(gid)
+    bot.reply_to(
+        message,
+        build_self_bill_report(gid, message.from_user, today, operator_only=True),
         parse_mode="HTML",
     )
 
@@ -3754,7 +3825,8 @@ def cmd_start(message):
             "• <code>开始</code> / <code>关闭</code> 开启或停止记账\n"
             "• <code>+1000</code>、<code>+1000/7.1</code>、<code>+1000*5</code>、<code>+1000U</code>\n"
             "• <code>下发500</code>、<code>下发500/7.8</code>、<code>+0</code> 查账\n"
-            "• <code>账单</code> 或 <code>/我</code> 群员自查\n"
+            "• <code>/账单</code> 或 <code>/我</code> 群员自查（按昵称/@用户名匹配备注）\n"
+            "• <code>/我记的</code> 操作人查今天自己记了几笔\n"
             "• 回复消息：<code>撤销</code>、<code>撤销入款5条</code>",
             parse_mode="HTML",
         )
@@ -4089,14 +4161,6 @@ def handle_all_messages(message):
     # --- group commands ---
     today, _ = get_billing_date_str(gid)
 
-    if text.strip() == "账单":
-        bot.reply_to(
-            message,
-            build_self_bill_report(gid, uid, today, display_name),
-            parse_mode="HTML",
-        )
-        return
-
     if process_reply_undo(message, gid, uid, tg_username, today):
         return
 
@@ -4344,6 +4408,24 @@ def handle_all_messages(message):
             bot.reply_to(message, tr(gid, "no_operate_perm"), parse_mode="HTML")
         return
 
+    parsed_exp = parse_expense_command(text, gid)
+    if parsed_exp:
+        try:
+            add_bill(
+                gid, uid, display_name,
+                parsed_exp.get("remark", ""),
+                parsed_exp["amount"],
+                "expense",
+                exchange_rate=parsed_exp.get("rate"),
+                source_message_id=message.message_id,
+                is_usdt_input=parsed_exp.get("is_usdt", False),
+            )
+            send_text_bill_report(gid, gid, today)
+        except Exception as exc:
+            log.exception("记下发失败: %s", exc)
+            bot.reply_to(message, tr(gid, "bill_fail", err=exc))
+        return
+
     parsed_inc = parse_income_command(text, gid)
     if parsed_inc:
         try:
@@ -4363,24 +4445,6 @@ def handle_all_messages(message):
             send_text_bill_report(gid, gid, today)
         except Exception as exc:
             log.exception("记入款失败: %s", exc)
-            bot.reply_to(message, tr(gid, "bill_fail", err=exc))
-        return
-
-    parsed_exp = parse_expense_command(text, gid)
-    if parsed_exp:
-        try:
-            add_bill(
-                gid, uid, display_name,
-                parsed_exp.get("remark", ""),
-                parsed_exp["amount"],
-                "expense",
-                exchange_rate=parsed_exp.get("rate"),
-                source_message_id=message.message_id,
-                is_usdt_input=parsed_exp.get("is_usdt", False),
-            )
-            send_text_bill_report(gid, gid, today)
-        except Exception as exc:
-            log.exception("记下发失败: %s", exc)
             bot.reply_to(message, tr(gid, "bill_fail", err=exc))
         return
 
